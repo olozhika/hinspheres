@@ -97,7 +97,8 @@ def diagnostic_plot(cfg, params, obs_map, model_map, save_path=None):
     # HI abundance profile
     from .profiles import abundance_profile_111n
     f_HI = abundance_profile_111n(cfg.n_shells, params['peak_shell'],
-                                   params['multipliers'])
+                                   params['multipliers'],
+                                   f_HI_peak=params.get('f_HI_peak', 1.0))
     r_mid = cfg.r_mid
     axes[1, 2].plot(r_mid, f_HI, 'o-', ms=5)
     axes[1, 2].axvline(r_mid[params['peak_shell'] - 1], ls='--', color='gray', alpha=0.5)

@@ -207,11 +207,16 @@ def radiative_transfer_pixel(
     n_v = len(v_grid_kms)
     T_B = np.zeros(n_v)
 
-    # Broadcast scalar background to array
+    # Broadcast scalar background/foreground to array
     if np.ndim(T_bg_kms) == 0:
         T_bg_arr = np.full(n_v, float(T_bg_kms))
     else:
         T_bg_arr = np.asarray(T_bg_kms, dtype=float)
+
+    if np.ndim(T_fg_kms) == 0:
+        T_fg_arr = np.full(n_v, float(T_fg_kms))
+    else:
+        T_fg_arr = np.asarray(T_fg_kms, dtype=float)
 
     for iv in range(n_v):
         v = v_grid_kms[iv]
@@ -225,9 +230,9 @@ def radiative_transfer_pixel(
             T_obs = T_obs * np.exp(-tau_v) + \
                     layer_T_spin[k] * (1.0 - np.exp(-tau_v))
 
-        # Foreground HI: absorbs T_obs, emits at T_fg_kms
+        # Foreground HI: absorbs T_obs, emits at T_fg
         T_obs = T_obs * np.exp(-tau_fg) + \
-                T_fg_kms * (1.0 - np.exp(-tau_fg))
+                T_fg_arr[iv] * (1.0 - np.exp(-tau_fg))
 
         T_B[iv] = T_obs
 
@@ -248,3 +253,111 @@ def compute_layer_tau0(n_HI, T_spin, dl_pc, sigma_kms, pc_cm):
     if sigma_cms < 1.0:
         return 0.0
     return const * n_HI * (dl_pc * pc_cm) / (T_spin * sigma_cms * np.sqrt(2.0 * np.pi))
+
+
+def inverse_radiative_transfer_pixel(
+    v_grid_kms,
+    n_layers,
+    layer_tau0,
+    layer_v_center_kms,
+    layer_sigma_kms,
+    layer_T_spin,
+    T_obs_kms,
+):
+    """Reverse RT: from observed spectrum, peel back each layer to recover T_bg.
+
+    Works near → far (opposite direction of radiative_transfer_pixel).
+    For each layer, inverts:
+        T_before = [T_after - T_ex * (1 - exp(-tau))] / exp(-tau)
+
+    Parameters
+    ----------
+    v_grid_kms : 1D array — velocity channels (km/s)
+    n_layers : int — number of shell intersections on this LOS
+    layer_tau0 : 1D array (n_layers,) — peak tau per layer
+    layer_v_center_kms : 1D array
+    layer_sigma_kms : 1D array
+    layer_T_spin : 1D array — excitation temperature per layer
+    T_obs_kms : 1D array — observed brightness temperature (K)
+
+    Returns
+    -------
+    T_bg_reconstructed : 1D array — reconstructed unabsorbed background (K)
+    """
+    T = np.asarray(T_obs_kms, dtype=np.float64).copy()
+
+    # Peel back layers: near → far
+    # layers from los_path_lengths are ordered far → near,
+    # so we iterate in reverse
+    for k in range(n_layers - 1, -1, -1):
+        tau_v = layer_tau0[k] * np.exp(
+            -0.5 * ((v_grid_kms - layer_v_center_kms[k]) / layer_sigma_kms[k])**2)
+        exp_neg_tau = np.exp(-tau_v)
+
+        # Invert: T_before = (T_after - T_ex * (1 - exp(-tau))) / exp(-tau)
+        # Guard against exp(-tau) ~ 0 (very optically thick)
+        safe = exp_neg_tau > 1e-10
+        T_new = np.where(
+            safe,
+            (T - layer_T_spin[k] * (1.0 - exp_neg_tau)) / np.where(safe, exp_neg_tau, 1.0),
+            T  # if tau too large, keep as-is (saturated)
+        )
+        T = T_new
+
+    return T
+
+
+def inverse_radiative_transfer_pixel_iter(
+    v_grid_kms,
+    n_layers,
+    layer_tau0,
+    layer_v_center_kms,
+    layer_sigma_kms,
+    layer_T_spin,
+    T_obs_kms,
+    n_iter=3,
+    poly_order=3,
+):
+    """Liu Method 2: iterative inverse RT with smoothing.
+
+    Starts from T_obs, iteratively refines T_bg using:
+        T_bg,(k+1) = T_obs + (1 - exp(-tau)) * smooth(T_bg,(k))
+
+    Parameters
+    ----------
+    v_grid_kms : 1D array — velocity channels (km/s)
+    n_layers : int
+    layer_tau0, layer_v_center_kms, layer_sigma_kms, layer_T_spin : 1D arrays
+    T_obs_kms : 1D array — observed brightness temperature (K)
+    n_iter : int — number of Liu Method 2 iterations
+    poly_order : int — polynomial order for smoothing
+
+    Returns
+    -------
+    T_bg_reconstructed : 1D array
+    """
+    # Compute total tau(v) across all layers
+    tau_total = np.zeros_like(v_grid_kms)
+    for k in range(n_layers):
+        tau_total += layer_tau0[k] * np.exp(
+            -0.5 * ((v_grid_kms - layer_v_center_kms[k]) / layer_sigma_kms[k])**2)
+
+    exp_neg_tau = np.exp(-tau_total)
+    one_minus_exp = 1.0 - exp_neg_tau
+
+    # Initial guess: simple inverse (no smoothing)
+    T_bg = np.where(
+        exp_neg_tau > 1e-10,
+        (T_obs_kms - 0.0 * one_minus_exp) / np.where(exp_neg_tau > 1e-10, exp_neg_tau, 1.0),
+        T_obs_kms
+    )
+
+    # Liu Method 2 iterations
+    for _ in range(n_iter):
+        # Smooth T_bg with polynomial
+        coeffs = np.polyfit(v_grid_kms, T_bg, poly_order)
+        T_bg_smooth = np.polyval(coeffs, v_grid_kms)
+        # Update: T_bg,(k+1) = T_obs + (1 - exp(-tau)) * smooth(T_bg)
+        T_bg = T_obs_kms + one_minus_exp * T_bg_smooth
+
+    return T_bg

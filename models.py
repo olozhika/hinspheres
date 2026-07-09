@@ -13,83 +13,122 @@ from .profiles import (
 )
 from .rt import (
     los_path_lengths, compute_layer_tau0,
-    radiative_transfer_pixel, los_velocity
+    radiative_transfer_pixel, los_velocity,
+    inverse_radiative_transfer_pixel, inverse_radiative_transfer_pixel_iter,
 )
 
 
-def build_synthetic_hinsa(cfg, params, T_HI_true_map=None, n_jobs=1):
-    """Forward-model a 2D HINSA intensity map from spherical cloud parameters.
+def build_synthetic_hinsa(cfg, params, bg_cube, center_yx, pixel_scale_pc,
+                          R_out_pc=None, vlsr_kms=None, n_jobs=1):
+    """Forward-model a synthetic HI cube with HINSA absorption.
+
+    The output grid always matches the input bg_cube.
 
     Parameters
     ----------
     cfg : Config
-    params : dict with keys:
-        rho0, r0, alpha      — density (may be pre-fitted from Planck)
-        T0, T1, rT           — temperature profile
-        peak_shell            — HI abundance peak (1-indexed)
-        multipliers           — 1D array len = n_shells-1
-        f_ff                  — free-fall fraction
-        turb_kms              — turbulence (km/s)
-    T_HI_true_map : 2D array or None
-        Background HI map (K) at each spatial pixel.
-        If None, a constant is used.
+    params : dict
+        Cloud model parameters.
+    bg_cube : ndarray, shape (n_v, ny, nx) or (ny, nx)
+        Background HI brightness-temperature (K).
+        - 3D: velocity-dependent background.
+        - 2D: broadcast to all velocities.
+        - None: constant 30 K (shape derived from cfg).
+    center_yx : tuple (yc, xc)
+        Pixel position of cloud centre in the bg spatial grid.
+    pixel_scale_pc : float
+        Spatial pixel scale in pc/pixel.
+    R_out_pc : float or None
+        Override cloud outer radius (pc). If None, uses cfg.R_out_pc.
+    vlsr_kms : float or None
+        Override cloud systemic velocity. If None, uses cfg.vlsr_kms.
     n_jobs : int
 
     Returns
     -------
-    hinsa_map : 2D array
-        Synthetic HINSA absorption intensity (positive = absorption).
-    cube : 3D array (optionally, if requested)
-        Full velocity-resolved data cube.
+    out_cube : 3D array (n_v, ny, nx)
+        Synthetic cube: background modified by cloud RT at each pixel.
     """
+    # Temporarily override cfg if requested
+    orig_R_out = cfg.R_out_pc
+    orig_vlsr = cfg.vlsr_kms
+    if R_out_pc is not None and R_out_pc != cfg.R_out_pc:
+        cfg.R_out_pc = R_out_pc
+        cfg._build_shell_radii()
+    if vlsr_kms is not None:
+        cfg.vlsr_kms = vlsr_kms
+
     ns = cfg.n_shells
 
     # --- 1. Radial profiles ---
     n_HI, T_spin, sigma_v, v_infall_kms = compute_radial_profiles(cfg, params)
 
-    # --- 2. Velocity grid ---
-    v_grid = np.linspace(cfg.v_min_kms, cfg.v_max_kms, cfg.n_v_channels)
-
-    # --- 3. Spatial grid ---
-    npix = int(2 * cfg.R_out_pc / cfg.pc_per_pix) + 1
-    npix = max(npix, 3) | 1  # odd
-    x = np.linspace(-cfg.R_out_pc, cfg.R_out_pc, npix)
-    X, Y = np.meshgrid(x, x)
-    B = np.sqrt(X**2 + Y**2)
-
-    # --- 4. Background/foreground HI ---
-    # If user provides T_HI_true_map, interpolate onto model grid (per-pixel)
-    if T_HI_true_map is not None and np.any(np.isfinite(T_HI_true_map)):
-        from scipy.ndimage import zoom as ndzoom
-        zoom_y = T_HI_true_map.shape[0] / npix
-        zoom_x = T_HI_true_map.shape[1] / npix
-        T_bg_2d = ndzoom(T_HI_true_map, (zoom_y, zoom_x), order=1)
-        # If zoom produced wrong shape, use nearest
-        if T_bg_2d.shape != (npix, npix):
-            T_bg_2d = ndzoom(T_HI_true_map, (npix / T_HI_true_map.shape[0],
-                                               npix / T_HI_true_map.shape[1]),
-                             order=0)
+    # --- 2. Determine grid from bg_cube ---
+    if bg_cube is not None and np.any(np.isfinite(bg_cube)):
+        if bg_cube.ndim == 3:
+            n_v, ny, nx = bg_cube.shape
+        else:
+            ny, nx = bg_cube.shape
+            n_v = cfg.n_v_channels
     else:
-        T_bg_2d = np.full((npix, npix), 30.0)  # default Galactic HI brightness
-    tau_bg = 0.1     # optically thin approximation
-    tau_fg = 0.02    # foreground (typically small)
+        # No background: build grid from cfg
+        npix = int(2 * cfg.R_out_pc / cfg.pc_per_pix) + 1
+        npix = max(npix, 3) | 1
+        ny = nx = npix
+        n_v = cfg.n_v_channels
+
+    v_grid = np.linspace(cfg.v_min_kms, cfg.v_max_kms, n_v)
+    yc, xc = center_yx
+
+    # --- 3. Build background array ---
+    bg_is_3d = False
+    T_bg_3d = None
+    T_bg_2d = None
+
+    if bg_cube is not None and np.any(np.isfinite(bg_cube)):
+        if bg_cube.ndim == 3:
+            bg_is_3d = True
+            T_bg_3d = bg_cube.astype(np.float64)
+        else:
+            T_bg_2d = bg_cube.astype(np.float64)
+    else:
+        T_bg_2d = np.full((ny, nx), 30.0)
+
+    tau_bg = 0.1
+    tau_fg = 0.02
 
     v_offset = params.get('v_offset', 0.0)
     v_rot_kms = params.get('v_rot_kms', 0.0)
     rot_pa_deg = params.get('rot_pa_deg', 0.0)
 
+    r_outer = cfg.r_outer
+    r_mid = cfg.r_mid
+    pc_cm = cfg.pc_cm
+
+    # --- 4. Impact-parameter map ---
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    dx_map = (xx - xc).astype(float) * pixel_scale_pc
+    b_map = np.sqrt(dx_map**2 + ((yy - yc).astype(float) * pixel_scale_pc)**2)
+
     # --- 5. Ray-trace per pixel ---
-    def _compute_pixel(ip, jp):
-        b = B[ip, jp]
-        dx = X[ip, jp]
-        if b > cfg.r_outer[-1]:
-            return 0.0
+    out_cube = np.empty((n_v, ny, nx), dtype=np.float64)
 
-        layers = los_path_lengths(b, cfg.r_outer, ns)
+    def _compute_pixel(j, i):
+        b = b_map[j, i]
+        dx = dx_map[j, i]
+
+        if bg_is_3d:
+            T_bg_spec = T_bg_3d[:, j, i]
+        else:
+            T_bg_spec = T_bg_2d[j, i]
+
+        if b >= r_outer[-1]:
+            return T_bg_spec.copy() if bg_is_3d else np.full(n_v, T_bg_spec)
+
+        layers = los_path_lengths(b, r_outer, ns)
         if not layers:
-            return 0.0
+            return T_bg_spec.copy() if bg_is_3d else np.full(n_v, T_bg_spec)
 
-        T_bg_px = T_bg_2d[ip, jp]
         n_layer = len(layers)
         tau0_arr = np.zeros(n_layer)
         v_center_arr = np.zeros(n_layer)
@@ -98,31 +137,148 @@ def build_synthetic_hinsa(cfg, params, T_HI_true_map=None, n_jobs=1):
 
         for il, (k, dl, z) in enumerate(layers):
             tau0_arr[il] = compute_layer_tau0(n_HI[k], T_spin[k], dl,
-                                               sigma_v[k], cfg.pc_cm)
-            v_los = los_velocity(b, z, cfg.r_mid, v_infall_kms,
+                                               sigma_v[k], pc_cm)
+            v_los = los_velocity(b, z, r_mid, v_infall_kms,
                                  v_rot_kms=v_rot_kms, rot_pa_deg=rot_pa_deg,
                                  dx=dx)
             v_center_arr[il] = v_los + cfg.vlsr_kms + v_offset
             sigma_arr[il] = sigma_v[k]
             T_s_arr[il] = T_spin[k]
 
+        T_fg = np.mean(T_bg_spec) if bg_is_3d else T_bg_spec
         T_B = radiative_transfer_pixel(
             v_grid, n_layer, tau0_arr, v_center_arr,
-            sigma_arr, T_s_arr, T_bg_px, T_bg_px, tau_bg, tau_fg
+            sigma_arr, T_s_arr, T_bg_spec, T_fg, tau_bg, tau_fg
         )
-
-        # HINSA absorption = unabsorbed HI - absorbed spectrum
-        hinsa_spec = T_bg_px - T_B
-        return np.nanmax(hinsa_spec)  # peak absorption
+        return T_B
 
     results = Parallel(n_jobs=n_jobs)(
-        delayed(_compute_pixel)(ip, jp)
-        for ip in range(npix) for jp in range(npix)
+        delayed(_compute_pixel)(j, i)
+        for j in range(ny) for i in range(nx)
     )
 
-    hinsa_map = np.array(results).reshape(npix, npix)
-    hinsa_map = np.maximum(hinsa_map, 0)
-    return hinsa_map
+    for idx, (j, i) in enumerate(
+            [(j, i) for j in range(ny) for i in range(nx)]):
+        out_cube[:, j, i] = results[idx]
+
+    # Restore cfg
+    cfg.R_out_pc = orig_R_out
+    cfg._build_shell_radii()
+    cfg.vlsr_kms = orig_vlsr
+
+    return out_cube
+
+
+def inverse_build_hinsa_cube(cfg, params, obs_cube, center_yx, pixel_scale_pc,
+                              R_out_pc=None, vlsr_kms=None, n_jobs=1,
+                              method='simple'):
+    """Inverse RT: from observed cube, recover reconstructed background T_bg.
+
+    Uses the physical model to compute tau at each pixel, then inverts
+    the RT to recover the unabsorbed background. For second-derivative fitting.
+
+    Parameters
+    ----------
+    cfg : Config
+    params : dict — cloud model parameters
+    obs_cube : ndarray, shape (n_v, ny, nx) — observed HI cube
+    center_yx : tuple (yc, xc)
+    pixel_scale_pc : float — pc/pixel
+    R_out_pc : float or None
+    vlsr_kms : float or None
+    n_jobs : int
+    method : str — 'simple' (direct inverse) or 'iterative' (Liu Method 2)
+
+    Returns
+    -------
+    T_bg_cube : 3D array (n_v, ny, nx) — reconstructed background
+    """
+    orig_R_out = cfg.R_out_pc
+    orig_vlsr = cfg.vlsr_kms
+    if R_out_pc is not None and R_out_pc != cfg.R_out_pc:
+        cfg.R_out_pc = R_out_pc
+        cfg._build_shell_radii()
+    if vlsr_kms is not None:
+        cfg.vlsr_kms = vlsr_kms
+
+    ns = cfg.n_shells
+    n_v, ny, nx = obs_cube.shape
+    v_grid = np.linspace(cfg.v_min_kms, cfg.v_max_kms, n_v)
+    yc, xc = center_yx
+
+    # --- Radial profiles ---
+    n_HI, T_spin, sigma_v, v_infall_kms = compute_radial_profiles(cfg, params)
+
+    v_offset = params.get('v_offset', 0.0)
+    v_rot_kms = params.get('v_rot_kms', 0.0)
+    rot_pa_deg = params.get('rot_pa_deg', 0.0)
+
+    r_outer = cfg.r_outer
+    r_mid = cfg.r_mid
+    pc_cm = cfg.pc_cm
+
+    # --- Impact-parameter map ---
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    dx_map = (xx - xc).astype(float) * pixel_scale_pc
+    b_map = np.sqrt(dx_map**2 + ((yy - yc).astype(float) * pixel_scale_pc)**2)
+
+    # --- Inverse RT per pixel ---
+    T_bg_cube = np.empty((n_v, ny, nx), dtype=np.float64)
+
+    def _compute_pixel(j, i):
+        b = b_map[j, i]
+        dx = dx_map[j, i]
+        T_obs_spec = obs_cube[:, j, i].astype(np.float64)
+
+        if b >= r_outer[-1]:
+            return T_obs_spec.copy()
+
+        layers = los_path_lengths(b, r_outer, ns)
+        if not layers:
+            return T_obs_spec.copy()
+
+        n_layer = len(layers)
+        tau0_arr = np.zeros(n_layer)
+        v_center_arr = np.zeros(n_layer)
+        sigma_arr = np.zeros(n_layer)
+        T_s_arr = np.zeros(n_layer)
+
+        for il, (k, dl, z) in enumerate(layers):
+            tau0_arr[il] = compute_layer_tau0(n_HI[k], T_spin[k], dl,
+                                               sigma_v[k], pc_cm)
+            v_los = los_velocity(b, z, r_mid, v_infall_kms,
+                                 v_rot_kms=v_rot_kms, rot_pa_deg=rot_pa_deg,
+                                 dx=dx)
+            v_center_arr[il] = v_los + cfg.vlsr_kms + v_offset
+            sigma_arr[il] = sigma_v[k]
+            T_s_arr[il] = T_spin[k]
+
+        # Inverse RT: peel back layers to recover T_bg
+        if method == 'iterative':
+            T_bg = inverse_radiative_transfer_pixel_iter(
+                v_grid, n_layer, tau0_arr, v_center_arr,
+                sigma_arr, T_s_arr, T_obs_spec)
+        else:
+            T_bg = inverse_radiative_transfer_pixel(
+                v_grid, n_layer, tau0_arr, v_center_arr,
+                sigma_arr, T_s_arr, T_obs_spec)
+        return T_bg
+
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_compute_pixel)(j, i)
+        for j in range(ny) for i in range(nx)
+    )
+
+    for idx, (j, i) in enumerate(
+            [(j, i) for j in range(ny) for i in range(nx)]):
+        T_bg_cube[:, j, i] = results[idx]
+
+    # Restore cfg
+    cfg.R_out_pc = orig_R_out
+    cfg._build_shell_radii()
+    cfg.vlsr_kms = orig_vlsr
+
+    return T_bg_cube
 
 
 def compute_enclosed_mass(n_H, cfg):
@@ -150,14 +306,16 @@ def compute_radial_profiles(cfg, params):
     if 'f_HI' in params:
         f_HI = np.asarray(params['f_HI'], dtype=float)
     else:
-        f_HI = abundance_profile_111n(cfg.n_shells, params['peak_shell'], params['multipliers'])
+        f_HI = abundance_profile_111n(cfg.n_shells, params['peak_shell'],
+                                       params['multipliers'],
+                                       f_HI_peak=params.get('f_HI_peak', 1.0))
     n_HI = n_H * f_HI
     T_spin = np.maximum(T, cfg.T_cmb)
 
     M_enc = compute_enclosed_mass(n_H, cfg)
     v_infall_kms = infall_velocity(
         cfg.r_mid * cfg.pc_cm, cfg.r_outer * cfg.pc_cm,
-        params['f_ff'], M_enc, cfg.G, cfg.m_H2 / 2.0
+        params['f_ff'], M_enc, cfg.G, 1.989e33
     ) / 1e5
 
     sigma_thermal = np.sqrt(cfg.k_B * T / (cfg.m_H * cfg.mu)) / 1e5
@@ -223,154 +381,56 @@ def synthetic_spectrum_at_pixel(cfg, params, b_pc, v_grid_kms, T_bg):
     return T_B
 
 
-def residual_map(obs_map, model_map):
-    """Chi-squared residual between observed and modeled HINSA."""
-    # Resize model to match observed if shapes differ
-    if model_map.shape != obs_map.shape:
-        from scipy.ndimage import zoom
-        zoom_factors = (obs_map.shape[0] / model_map.shape[0],
-                        obs_map.shape[1] / model_map.shape[1])
-        model_map = zoom(model_map, zoom_factors, order=1)
-    mask = (obs_map > 0) & np.isfinite(obs_map) & (model_map > 0)
-    if not np.any(mask):
-        return 1e10
-    diff = obs_map[mask] - model_map[mask]
-    return np.nansum(diff**2 / np.maximum(obs_map[mask], 0.01))
+def residual_map(obs_map, model_map, weights=None):
+    """Normalized residual between observed and modeled HINSA.
 
-
-def forward_model_cube(cfg, params, bg_cube, velo_kms, center_yx,
-                       pixel_scale_pc, vlsr_kms=None, R_out_pc=None):
-    """Forward-model a synthetic HI cube with HINSA absorption.
-
-    Takes a background HI brightness-temperature cube, places a spherical
-    cloud model in front of it, computes ray-tracing through the cloud at
-    every spatial pixel, and returns a cube of the same shape containing
-    the resulting spectrum (background modified by cloud absorption/emission).
+    Returns weighted mean of (obs-model)^2 / |obs|, normalized by the sum
+    of weights.  Zero for a perfect fit; independent of map size.
 
     Parameters
     ----------
-    cfg : Config
-        Must have n_shells, R_out_pc, etc. Set vlsr_kms via cfg or vlsr_kms arg.
-    params : dict
-        Cloud model parameters (rho0, r0, alpha, T0, T1, rT, peak_shell,
-        multipliers, f_ff, turb_kms, v_offset, ...).
-    bg_cube : ndarray, shape (n_v, ny, nx)
-        Background HI brightness-temperature cube (K). The velocity axis
-        must correspond to velo_kms.
-    velo_kms : 1D array, shape (n_v,)
-        Velocity axis of bg_cube in km/s (observed frame, e.g. LSR).
-    center_yx : tuple (yc, xc)
-        Pixel position of the cloud centre in the bg_cube spatial grid.
-    pixel_scale_pc : float
-        Spatial pixel scale in pc/pixel.
-    vlsr_kms : float or None
-        Cloud systemic velocity (km/s).  If None, taken from cfg.vlsr_kms.
-    R_out_pc : float or None
-        Override cloud outer radius (pc). If None, uses cfg.R_out_pc.
-        Useful when CO-observed radius differs from HI extent.
-
-    Returns
-    -------
-    out_cube : ndarray, shape (n_v, ny, nx)
-        Synthetic cube: background spectrum modified by cloud RT at each pixel.
+    obs_map, model_map : ndarray
+    weights : 2D ndarray (ny, nx) or None
+        Radial weights (1/r). If None, uniform weight=1.
     """
-    if vlsr_kms is None:
-        vlsr_kms = cfg.vlsr_kms
-    # Temporarily override R_out_pc and rebuild shell radii if requested
-    orig_R_out = cfg.R_out_pc
-    if R_out_pc is not None and R_out_pc != cfg.R_out_pc:
-        cfg.R_out_pc = R_out_pc
-        cfg._build_shell_radii()
-    # Temporarily set vlsr on cfg for los_velocity / v_center computation
-    orig_vlsr = cfg.vlsr_kms
-    cfg.vlsr_kms = vlsr_kms
+    # Resize model to match observed if spatial shapes differ
+    if model_map.shape != obs_map.shape:
+        from scipy.ndimage import zoom
+        if model_map.ndim == 3 and obs_map.ndim == 3:
+            zoom_factors = (1.0,
+                            obs_map.shape[1] / model_map.shape[1],
+                            obs_map.shape[2] / model_map.shape[2])
+        else:
+            zoom_factors = (obs_map.shape[0] / model_map.shape[0],
+                            obs_map.shape[1] / model_map.shape[1])
+        model_map = zoom(model_map, zoom_factors, order=1)
 
-    n_v, ny, nx = bg_cube.shape
-    yc, xc = center_yx
+    mask = np.isfinite(obs_map) & np.isfinite(model_map)
+    if not np.any(mask):
+        return 1e10
+    diff = obs_map[mask] - model_map[mask]
+    denom = np.maximum(np.abs(obs_map[mask]), 0.01)
+    val = diff**2 / denom
 
-    # --- 1. Radial profiles (same for all pixels) ---
-    n_HI, T_spin, sigma_v, v_infall_kms = compute_radial_profiles(cfg, params)
-    v_offset = params.get('v_offset', 0.0)
-    v_grid = np.asarray(velo_kms, dtype=float)
+    if weights is not None:
+        if model_map.ndim == 3 and weights.ndim == 2:
+            w = np.broadcast_to(weights, model_map.shape)
+        else:
+            w = weights
+        val = val * w[mask]
+        w_sum = np.nansum(w[mask])
+    else:
+        w_sum = float(np.sum(mask))
 
-    # Pre-compute shell geometry
-    r_outer = cfg.r_outer
-    r_mid = cfg.r_mid
-    ns = cfg.n_shells
-    pc_cm = cfg.pc_cm
-
-    # --- 2. Build impact-parameter and offset maps ---
-    yy, xx = np.mgrid[0:ny, 0:nx]
-    dx_map = (xx - xc).astype(float) * pixel_scale_pc  # pc, x-offset from center
-    b_map = np.sqrt(dx_map**2 + ((yy - yc).astype(float) * pixel_scale_pc)**2)
-
-    # Rotation parameters
-    v_rot_kms = params.get('v_rot_kms', 0.0)
-    rot_pa_deg = params.get('rot_pa_deg', 0.0)
-
-    # --- 3. Ray-trace per pixel ---
-    out_cube = np.empty_like(bg_cube, dtype=np.float32)
-
-    def _compute_pixel(j, i):
-        b = b_map[j, i]
-        dx = dx_map[j, i]
-        T_bg_spec = bg_cube[:, j, i].astype(float)
-
-        if b >= r_outer[-1]:
-            return T_bg_spec
-
-        layers = los_path_lengths(b, r_outer, ns)
-        if not layers:
-            return T_bg_spec
-
-        n_layer = len(layers)
-        tau0_arr = np.zeros(n_layer)
-        v_center_arr = np.zeros(n_layer)
-        sigma_arr = np.zeros(n_layer)
-        T_s_arr = np.zeros(n_layer)
-
-        for il, (k, dl, z) in enumerate(layers):
-            tau0_arr[il] = compute_layer_tau0(n_HI[k], T_spin[k], dl,
-                                               sigma_v[k], pc_cm)
-            v_los = los_velocity(b, z, r_mid, v_infall_kms,
-                                 v_rot_kms=v_rot_kms, rot_pa_deg=rot_pa_deg,
-                                 dx=dx)
-            v_center_arr[il] = v_los + vlsr_kms + v_offset
-            sigma_arr[il] = sigma_v[k]
-            T_s_arr[il] = T_spin[k]
-
-        tau_bg = 0.1
-        tau_fg = 0.02
-        T_B = radiative_transfer_pixel(
-            v_grid, n_layer, tau0_arr, v_center_arr,
-            sigma_arr, T_s_arr, T_bg_spec, np.mean(T_bg_spec), tau_bg, tau_fg
-        )
-        return T_B.astype(np.float32)
-
-    from joblib import Parallel, delayed
-    n_jobs = getattr(cfg, 'n_jobs', 1)
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(_compute_pixel)(j, i)
-        for j in range(ny) for i in range(nx)
-    )
-
-    for idx, j in enumerate(range(ny)):
-        for i in range(nx):
-            flat_idx = idx * nx + i
-            out_cube[:, j, i] = results[flat_idx]
-
-    # Restore original cfg values
-    cfg.vlsr_kms = orig_vlsr
-    cfg.R_out_pc = orig_R_out
-    cfg._build_shell_radii()
-    return out_cube
+    return float(np.nansum(val) / w_sum)
 
 
 def generate_sim_hinsa(output_path, background=None, center_pixel=None,
                        vlsr_kms=None, R_out_pc=None, distance_pc=None,
                        rho0=500, r0=0.05, alpha=1.0,
                        T0=10.0, T1=40.0, rT=0.15,
-                       peak_shell=1, multipliers=None, abundance=None,
+                       peak_shell=1, f_HI_peak=1.0, multipliers=None,
+                       abundance=None,
                        f_ff=0.1, turb_kms=0.15, v_offset=0.0,
                        v_rot_kms=0.0, rot_pa_deg=0.0,
                        spatial_res_pc=None, vel_res_kms=None,
@@ -553,6 +613,7 @@ def generate_sim_hinsa(output_path, background=None, center_pixel=None,
         params['f_HI'] = np.asarray(abundance, dtype=float)
     else:
         params['peak_shell'] = peak_shell
+        params['f_HI_peak'] = f_HI_peak
         params['multipliers'] = multipliers
 
     if verbose:
@@ -562,8 +623,8 @@ def generate_sim_hinsa(output_path, background=None, center_pixel=None,
         print(f"       center=({yc}, {xc}), pix_scale={pixel_scale_pc:.4f} pc")
         print(f"Forward-modeling {ny}x{nx} pixels ...")
 
-    out_cube = forward_model_cube(
-        cfg, params, bg_cube, velo_kms, (yc, xc), pixel_scale_pc
+    out_cube = build_synthetic_hinsa(
+        cfg, params, bg_cube, (yc, xc), pixel_scale_pc, n_jobs=n_jobs
     )
 
     # --- Spatial + velocity smoothing ---
@@ -723,7 +784,9 @@ def _save_diagnostic_png(png_path, cfg, params, out_cube, velo_kms,
     if abundance is not None:
         f_HI = np.asarray(abundance, dtype=float)
     else:
-        f_HI = abundance_profile_111n(cfg.n_shells, params['peak_shell'], params['multipliers'])
+        f_HI = abundance_profile_111n(cfg.n_shells, params['peak_shell'],
+                                       params['multipliers'],
+                                       f_HI_peak=params.get('f_HI_peak', 1.0))
     axes[0, 2].plot(r_mid, f_HI, 'o-', color='C2')
     axes[0, 2].set_xlabel('r (pc)')
     axes[0, 2].set_ylabel('f_HI')

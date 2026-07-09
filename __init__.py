@@ -13,15 +13,20 @@ Reference models:
 from .config import Config
 from .profiles import density_plummer, temperature_plummer, \
     abundance_profile_111n, infall_velocity
-from .rt import make_shells, los_path_lengths, radiative_transfer_pixel
-from .models import build_synthetic_hinsa, forward_model_cube, generate_sim_hinsa
-from .fitters import fit_hinspheres
+from .rt import make_shells, los_path_lengths, radiative_transfer_pixel, \
+    inverse_radiative_transfer_pixel
+from .models import build_synthetic_hinsa, inverse_build_hinsa_cube, \
+    generate_sim_hinsa, residual_map
+from .fitters import fit_hinspheres, fit_hinsa_model, reload_fit_result
 
 __all__ = [
     'Config',
     'density_plummer', 'temperature_plummer',
     'abundance_profile_111n', 'infall_velocity',
     'make_shells', 'los_path_lengths', 'radiative_transfer_pixel',
-    'build_synthetic_hinsa', 'forward_model_cube', 'generate_sim_hinsa',
-    'fit_hinspheres',
+    'inverse_radiative_transfer_pixel',
+    'build_synthetic_hinsa', 'inverse_build_hinsa_cube',
+    'generate_sim_hinsa',
+    'residual_map', 'fit_hinsa_model', 'fit_hinspheres',
+    'reload_fit_result',
 ]

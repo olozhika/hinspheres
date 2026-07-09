@@ -10,7 +10,7 @@ class Config:
 
     # ---- Spherical shells ----
     n_shells: int = 9
-    R_out_pc: float = 0.15        # total cloud radius in pc
+    R_out_pc: float = 5.        # total cloud radius in pc
 
     # ---- Physical constants (CGS) ----
     k_B = 1.380649e-16            # erg/K
@@ -39,18 +39,39 @@ class Config:
 
     # ---- Fitting bounds for CMA-ES ----
     bounds_pc = {
-        'r0': (0.01, 0.15),        # Plummer core radius in pc
-        'alpha': (1.0, 5.0),       # Plummer power-law index
-        'T0': (5.0, 30.0),         # central temperature K
-        'T1': (10.0, 80.0),        # ambient temperature K
-        'rT': (0.01, 0.15),        # temperature transition radius pc
-        'peak_shell': (1, 9),      # HI abundance peak shell (1-indexed)
-        'multipliers': (0.1, 1.0), # abundance decrease factor per step
-        'f_ff': (0.01, 0.5),       # free-fall fraction
-        'turb_kms': (0.05, 0.5),   # turbulence km/s
-        'v_offset': (-3.0, 3.0),   # systemic velocity offset relative to Vlsr (km/s)
-        'v_rot_kms': (0.0, 5.0),  # rotation velocity at R_out (km/s)
+        'rho0': (100.0, 100000.0),   # central density cm^-3
+        'r0': (0.01, 0.3),          # Plummer core radius in pc
+        'alpha': (1.0, 5.0),         # Plummer power-law index
+        'T0': (5.0, 30.0),           # central temperature K
+        'T1': (10.0, 80.0),          # ambient temperature K
+        'rT': (0.01, 0.3),          # temperature transition radius pc
+        'peak_shell': (1, 9),        # HI abundance peak shell (1-indexed)
+        'f_HI_peak': (0.0001, 0.5),   # peak shell HI abundance
+        'multipliers': (0.01, 1.0),   # abundance decrease factor per step
+        'f_HI': (0.0001, 0.5),        # per-shell HI abundance (f_HI mode)
+        'f_ff': (0.01, 0.5),         # free-fall fraction
+        'turb_kms': (0.05, 0.5),     # turbulence km/s
+        'v_offset': (-3.0, 3.0),     # systemic velocity offset relative to Vlsr (km/s)
+        'v_rot_kms': (0.0, 5.0),    # rotation velocity at R_out (km/s)
         'rot_pa_deg': (0.0, 180.0),  # rotation axis position angle (deg, N to E)
+    }
+
+    # ---- Default initial parameters for CMA-ES ----
+    default_params = {
+        'rho0': 5000.0,
+        'r0': 0.1,
+        'alpha': 2.0,
+        'T0': 10.0,
+        'T1': 58.0,
+        'rT': 0.1,
+        'peak_shell': 9,
+        'f_HI_peak': 0.05,
+        'multipliers_value': 0.7,    # default multiplier for each shell
+        'f_ff': 0.1,
+        'turb_kms': 0.2,
+        'v_offset': 0.0,
+        'v_rot_kms': 0.0,
+        'rot_pa_deg': 0.0,
     }
 
     def __init__(self, **kwargs):

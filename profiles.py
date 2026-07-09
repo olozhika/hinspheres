@@ -104,7 +104,7 @@ def temperature_plummer(r_mid, T0, T1, rt, T_dex=2.0):
     return T1 + (T0 - T1) / (1.0 + (r_mid / rt)**T_dex)
 
 
-def abundance_profile_111n(n_shells, peak_shell, multipliers):
+def abundance_profile_111n(n_shells, peak_shell, multipliers, f_HI_peak=1.0):
     """Unimodal abundance profile following l1517's 111.n convention.
 
     The HI abundance peaks at `peak_shell` (1-indexed) and decreases
@@ -120,6 +120,8 @@ def abundance_profile_111n(n_shells, peak_shell, multipliers):
         abundance[m] / abundance[m-1] going outward from the peak.
         The actual values are the exponential of the optimized parameter
         clipped to [0.1, 1.0].
+    f_HI_peak : float
+        Absolute HI abundance at the peak shell (default 1.0).
 
     Returns
     -------
@@ -132,7 +134,7 @@ def abundance_profile_111n(n_shells, peak_shell, multipliers):
     # Build left side (k → 0)
     for i in range(k, -1, -1):
         if i == k:
-            f_HI[i] = 1.0
+            f_HI[i] = f_HI_peak
         else:
             idx = i  # multiplier index
             f_HI[i] = f_HI[i + 1] * multipliers[idx]
