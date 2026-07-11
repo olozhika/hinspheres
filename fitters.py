@@ -1087,9 +1087,12 @@ def _save_fit_diagnostic_png(png_path, cfg, params, model_cube,
     R_pix = np.sqrt((xx - xc)**2 + (yy - yc)**2) * pixel_scale_pc
     NHI_map = np.interp(R_pix.ravel(), R_grid, NHI_1d).reshape(ny, nx)
 
-    vmin_nhi, vmax_nhi = 0, np.nanmax(NHI_map) * 1.05 if np.any(NHI_map > 0) else 1.0
+    from matplotlib.colors import LogNorm
+    NHI_pos = NHI_map[NHI_map > 0]
+    vmin_nhi = np.nanmin(NHI_pos) * 0.5 if len(NHI_pos) > 0 else 1e18
+    vmax_nhi = np.nanmax(NHI_pos) * 1.5 if len(NHI_pos) > 0 else 1e22
     im = axes[1, 1].imshow(NHI_map, origin='lower', cmap='YlOrRd',
-                            vmin=vmin_nhi, vmax=vmax_nhi)
+                            norm=LogNorm(vmin=vmin_nhi, vmax=vmax_nhi))
     axes[1, 1].plot(xc, yc, 'b+', ms=10, mew=1.5)
     axes[1, 1].set_title('Cold Cloud N(HI) (cm$^{-2}$)')
     fig.colorbar(im, ax=axes[1, 1], label='cm$^{-2}$')
