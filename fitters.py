@@ -975,12 +975,10 @@ def _save_fit_diagnostic_png(png_path, cfg, params, model_cube,
     crpix3 = obs_hdr.get('CRPIX3', 1.0)
     n_v = obs_cube.shape[0]
     velo_kms = (crval3 + cdelt3 * (np.arange(n_v) - (crpix3 - 1))) / 1000.0
+    # Data cubes are already pre-flipped to ascending by fit_hinsa_model;
+    # only fix the velocity axis order if needed.
     if velo_kms[-1] < velo_kms[0]:
         velo_kms = velo_kms[::-1]
-        obs_cube = obs_cube[::-1]
-        model_cube = model_cube[::-1]
-        if bg_cube is not None:
-            bg_cube = bg_cube[::-1]
 
     r_mid = cfg.r_mid
 
@@ -1104,10 +1102,10 @@ def _save_grid_spectrum_png(png_path, obs_cube, model_cube, bg_cube,
     cdelt3 = obs_hdr.get('CDELT3', 200.0)
     crpix3 = obs_hdr.get('CRPIX3', 1.0)
     velo_kms = (crval3 + cdelt3 * (np.arange(n_v) - (crpix3 - 1))) / 1000.0
+    # Data cubes are already pre-flipped to ascending by fit_hinsa_model;
+    # only fix the velocity axis order if needed.
     if velo_kms[-1] < velo_kms[0]:
         velo_kms = velo_kms[::-1]
-        obs_cube = obs_cube[::-1]
-        model_cube = model_cube[::-1]
 
     # Moment 0 map (±1 km/s of vlsr) as single background
     dv = np.abs(velo_kms - vlsr_kms)
