@@ -412,12 +412,13 @@ def _params_to_flat(params_init, bounds, cfg):
                 val = params_init['T1']
             elif key == 'rT':
                 val = params_init['rT']
+            elif key == 'f_HI_peak':
+                val = float(params_init.get('f_HI_peak', cfg.default_params['f_HI_peak']))
             elif key.startswith('f_HI_'):
                 idx = int(key.split('_')[-1])
                 val = float(np.asarray(params_init['f_HI'], dtype=float)[idx])
             elif key == 'peak_shell':
                 val = float(params_init['peak_shell'])
-            elif key == 'f_HI_peak':
                 val = float(params_init.get('f_HI_peak', cfg.default_params['f_HI_peak']))
             elif key.startswith('mult_'):
                 idx = int(key.split('_')[-1])
