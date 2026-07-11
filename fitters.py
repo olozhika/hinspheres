@@ -172,18 +172,19 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
             _sigma_xy = (spatial_res_pc / pixel_scale_pc) / _sigma_fwhm2sig
     _need_smooth = (_sigma_v > 0) or (_sigma_xy > 0)
 
-    param_keys, x0, low, high = _params_to_flat(params_init, bounds, cfg)
+    param_keys, x0, phys_lows, phys_highs = _params_to_flat(params_init, bounds, cfg)
 
-    # Separate fixed params (lb==ub) from free params
-    fixed_idx = [i for i, (l, h) in enumerate(zip(low, high)) if l == h]
-    free_idx = [i for i, (l, h) in enumerate(zip(low, high)) if l < h]
+    # Separate fixed params (phys_low == phys_high, zero range) from free params
+    phys_ranges = phys_highs - phys_lows
+    fixed_idx = [i for i in range(len(param_keys)) if phys_ranges[i] == 0]
+    free_idx = [i for i in range(len(param_keys)) if phys_ranges[i] > 0]
 
     fixed_keys = [param_keys[i] for i in fixed_idx]
-    fixed_vals_dict = {param_keys[i]: x0[i] for i in fixed_idx}
 
     x0_free = x0[free_idx]
-    low_free = low[free_idx]
-    high_free = high[free_idx]
+    # CMA-ES bounds: all [0,1] in normalized space
+    low_free = np.zeros(len(free_idx))
+    high_free = np.ones(len(free_idx))
     free_keys = [param_keys[i] for i in free_idx]
 
     n_dim = len(x0_free)
@@ -212,11 +213,12 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
 
     def _reconstruct(x_free):
         """Merge free CMA-ES vector with fixed params → full param dict."""
-        # Build full x vector: insert fixed values back
+        # Build full [0,1] vector: insert fixed values back
         x_full = np.copy(x0)
         for fi, fv in zip(free_idx, x_free):
             x_full[fi] = fv
-        return _flat_to_params(x_full, param_keys, cfg, vals=x0, bounds=bounds)
+        return _flat_to_params(x_full, param_keys, cfg,
+                               phys_lows=phys_lows, phys_highs=phys_highs)
 
     while not es.stop():
         solutions = es.ask()
@@ -282,22 +284,17 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
     params_best = _reconstruct(best_x)
 
     # Extract 1-sigma uncertainties from CMA-ES covariance
-    # stds_free are in CMA-ES search space (log-space for positive params)
-    # Convert back to physical space: σ_phys ≈ value * σ_log for log-transformed params
+    # stds_free are in [0,1] normalized space.
+    # Convert to physical space: σ_phys = σ_01 * (phys_high - phys_low)
     stds_free = es.result.stds
     param_stds = {}
-    log_params = {'rho0', 'r0', 'T0', 'T1', 'rT', 'f_HI_peak',
-                  'multipliers', 'f_ff', 'turb_kms', 'v_rot_kms'}
 
-    for fi, fv in zip(fixed_idx, x0[fixed_idx]):
+    for fi in fixed_idx:
         param_stds[param_keys[fi]] = 0.0  # fixed params have 0 uncertainty
     for i, idx in enumerate(free_idx):
         pname = param_keys[idx]
-        if pname in log_params:
-            # Convert log-space std to physical-space std: σ_phys ≈ value * σ_log
-            param_stds[pname] = float(abs(params_best.get(pname, 1.0)) * stds_free[i])
-        else:
-            param_stds[pname] = float(stds_free[i])
+        phys_range = phys_highs[idx] - phys_lows[idx]
+        param_stds[pname] = float(stds_free[i] * phys_range)
 
     # Aggregate array-element stds (f_HI_0, f_HI_1, ..., mult_0, ...) into arrays
     for arr_name in ('f_HI', 'multipliers'):
@@ -319,180 +316,186 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
 
 
 def _params_to_flat(params_init, bounds, cfg):
-    """Convert parameter dict to flat vector for CMA-ES.
+    """Convert parameter dict to flat [0,1] vector for CMA-ES.
+
+    All parameters are linearly mapped to [0,1]:
+        x_01 = (val - phys_low) / (phys_high - phys_low)
+
+    Returns keys, x_01, phys_lows, phys_highs so _flat_to_params can
+    map back to physical space.
 
     Supports two abundance modes:
       - 'f_HI' key present: direct per-shell abundance (n_shells values)
       - 'peak_shell' + 'multipliers': parametric abundance (1 + n_shells-1 values)
     """
     keys = []
-    vals = []
-    lows = []
-    highs = []
+    phys_lows = []
+    phys_highs = []
 
-    # rho0 — log-scale
-    keys.append('rho0')
-    vals.append(np.log(params_init['rho0']))
+    def _add(key, val, lo, hi):
+        keys.append(key)
+        phys_lows.append(float(lo))
+        phys_highs.append(float(hi))
+
+    # --- Scalar parameters ---
     rho0_bounds = bounds.get('rho0', cfg.bounds_pc['rho0'])
-    lows.append(np.log(float(rho0_bounds[0])))
-    highs.append(np.log(float(rho0_bounds[1])))
+    _add('rho0', params_init['rho0'], rho0_bounds[0], rho0_bounds[1])
+    _add('r0', params_init['r0'], bounds['r0'][0], bounds['r0'][1])
+    _add('alpha', params_init['alpha'], bounds['alpha'][0], bounds['alpha'][1])
+    _add('T0', params_init['T0'], bounds['T0'][0], bounds['T0'][1])
+    _add('T1', params_init['T1'], bounds['T1'][0], bounds['T1'][1])
+    _add('rT', params_init['rT'], bounds['rT'][0], bounds['rT'][1])
 
-    # r0 — log-scale
-    keys.append('r0')
-    vals.append(np.log(params_init['r0']))
-    lows.append(np.log(bounds['r0'][0]))
-    highs.append(np.log(bounds['r0'][1]))
-
-    # alpha — linear
-    keys.append('alpha')
-    vals.append(params_init['alpha'])
-    lows.append(bounds['alpha'][0])
-    highs.append(bounds['alpha'][1])
-
-    # T0 — log-scale
-    keys.append('T0')
-    vals.append(np.log(params_init['T0']))
-    lows.append(np.log(bounds['T0'][0]))
-    highs.append(np.log(bounds['T0'][1]))
-
-    # T1 — log-scale
-    keys.append('T1')
-    vals.append(np.log(params_init['T1']))
-    lows.append(np.log(bounds['T1'][0]))
-    highs.append(np.log(bounds['T1'][1]))
-
-    # rT — log-scale
-    keys.append('rT')
-    vals.append(np.log(params_init['rT']))
-    lows.append(np.log(bounds['rT'][0]))
-    highs.append(np.log(bounds['rT'][1]))
-
-    # Abundance: either f_HI (direct) or peak_shell + multipliers
+    # --- Abundance: either f_HI (direct) or peak_shell + multipliers ---
     if 'f_HI' in params_init:
         f_HI = np.asarray(params_init['f_HI'], dtype=float)
         f_hi_bounds = bounds.get('f_HI', cfg.bounds_pc['f_HI'])
         for i in range(cfg.n_shells):
-            keys.append(f'f_HI_{i}')
-            vals.append(np.log(max(float(f_HI[i]), 1e-10)))
             if isinstance(f_hi_bounds, (list, tuple)) and len(f_hi_bounds) == cfg.n_shells:
                 lo, hi = f_hi_bounds[i]
             else:
                 lo, hi = f_hi_bounds
-            lows.append(np.log(max(float(lo), 1e-10)))
-            highs.append(np.log(float(hi)))
+            _add(f'f_HI_{i}', float(f_HI[i]), float(lo), float(hi))
     else:
         ps_lo, ps_hi = float(bounds['peak_shell'][0]), float(bounds['peak_shell'][1])
         if ps_lo == ps_hi:
-            # Fixed peak_shell: don't add to search vector
             keys.append('_fixed_peak_shell')
-            vals.append(ps_lo)
-            lows.append(ps_lo)
-            highs.append(ps_hi)
+            phys_lows.append(ps_lo)
+            phys_highs.append(ps_hi)
         else:
-            keys.append('peak_shell')
-            vals.append(float(params_init['peak_shell']))
-            lows.append(ps_lo)
-            highs.append(ps_hi)
+            _add('peak_shell', float(params_init['peak_shell']), ps_lo, ps_hi)
 
-        f_hp_lo, f_hp_hi = float(bounds.get('f_HI_peak', cfg.bounds_pc['f_HI_peak'])[0]), \
-                           float(bounds.get('f_HI_peak', cfg.bounds_pc['f_HI_peak'])[1])
+        f_hp_lo = float(bounds.get('f_HI_peak', cfg.bounds_pc['f_HI_peak'])[0])
+        f_hp_hi = float(bounds.get('f_HI_peak', cfg.bounds_pc['f_HI_peak'])[1])
         if f_hp_lo == f_hp_hi:
             keys.append('_fixed_f_HI_peak')
-            vals.append(np.log(f_hp_lo))
-            lows.append(np.log(f_hp_lo))
-            highs.append(np.log(f_hp_hi))
+            phys_lows.append(f_hp_lo)
+            phys_highs.append(f_hp_hi)
         else:
-            keys.append('f_HI_peak')
-            vals.append(np.log(float(params_init.get('f_HI_peak', cfg.default_params['f_HI_peak']))))
-            lows.append(np.log(f_hp_lo))
-            highs.append(np.log(f_hp_hi))
+            _add('f_HI_peak',
+                 float(params_init.get('f_HI_peak', cfg.default_params['f_HI_peak'])),
+                 f_hp_lo, f_hp_hi)
 
         for i in range(cfg.n_shells - 1):
             m = params_init['multipliers'][i] if i < len(params_init['multipliers']) else cfg.default_params['multipliers_value']
-            keys.append(f'mult_{i}')
-            vals.append(np.log(m))
-            lows.append(np.log(bounds['multipliers'][0]))
-            highs.append(np.log(bounds['multipliers'][1]))
+            _add(f'mult_{i}', float(m),
+                 float(bounds['multipliers'][0]), float(bounds['multipliers'][1]))
 
-    # f_ff — log-scale
-    keys.append('f_ff')
-    vals.append(np.log(params_init['f_ff']))
-    lows.append(np.log(bounds['f_ff'][0]))
-    highs.append(np.log(bounds['f_ff'][1]))
+    # --- Kinematics ---
+    _add('f_ff', params_init['f_ff'], bounds['f_ff'][0], bounds['f_ff'][1])
+    _add('turb_kms', params_init['turb_kms'], bounds['turb_kms'][0], bounds['turb_kms'][1])
+    _add('v_offset', params_init['v_offset'], bounds['v_offset'][0], bounds['v_offset'][1])
+    _add('v_rot_kms', params_init['v_rot_kms'], bounds['v_rot_kms'][0], bounds['v_rot_kms'][1])
+    _add('rot_pa_deg', params_init['rot_pa_deg'], bounds['rot_pa_deg'][0], bounds['rot_pa_deg'][1])
 
-    # turb_kms — log-scale
-    keys.append('turb_kms')
-    vals.append(np.log(params_init['turb_kms']))
-    lows.append(np.log(bounds['turb_kms'][0]))
-    highs.append(np.log(bounds['turb_kms'][1]))
+    # Normalize to [0,1]
+    phys_lows = np.array(phys_lows)
+    phys_highs = np.array(phys_highs)
+    phys_ranges = phys_highs - phys_lows
+    phys_ranges[phys_ranges == 0] = 1.0  # fixed params: range=0, keep at 0
 
-    # v_offset — linear (can be negative)
-    keys.append('v_offset')
-    vals.append(params_init['v_offset'])
-    lows.append(bounds['v_offset'][0])
-    highs.append(bounds['v_offset'][1])
+    x_raw = []
+    for i, key in enumerate(keys):
+        if key.startswith('_fixed_'):
+            x_raw.append(0.0)  # fixed params are always at 0
+        else:
+            # Reconstruct physical value from params_init
+            if key == 'rho0':
+                val = params_init['rho0']
+            elif key == 'r0':
+                val = params_init['r0']
+            elif key == 'alpha':
+                val = params_init['alpha']
+            elif key == 'T0':
+                val = params_init['T0']
+            elif key == 'T1':
+                val = params_init['T1']
+            elif key == 'rT':
+                val = params_init['rT']
+            elif key.startswith('f_HI_'):
+                idx = int(key.split('_')[-1])
+                val = float(np.asarray(params_init['f_HI'], dtype=float)[idx])
+            elif key == 'peak_shell':
+                val = float(params_init['peak_shell'])
+            elif key == 'f_HI_peak':
+                val = float(params_init.get('f_HI_peak', cfg.default_params['f_HI_peak']))
+            elif key.startswith('mult_'):
+                idx = int(key.split('_')[-1])
+                val = float(params_init['multipliers'][idx]) if idx < len(params_init['multipliers']) else cfg.default_params['multipliers_value']
+            elif key == 'f_ff':
+                val = params_init['f_ff']
+            elif key == 'turb_kms':
+                val = params_init['turb_kms']
+            elif key == 'v_offset':
+                val = params_init['v_offset']
+            elif key == 'v_rot_kms':
+                val = params_init['v_rot_kms']
+            elif key == 'rot_pa_deg':
+                val = params_init['rot_pa_deg']
+            else:
+                val = phys_lows[i]
+            x_raw.append((val - phys_lows[i]) / phys_ranges[i])
 
-    # v_rot_kms — log-scale
-    keys.append('v_rot_kms')
-    vals.append(np.log(max(params_init['v_rot_kms'], 1e-10)))
-    lows.append(np.log(max(bounds['v_rot_kms'][0], 1e-10)))
-    highs.append(np.log(bounds['v_rot_kms'][1]))
-
-    # rot_pa_deg — linear
-    keys.append('rot_pa_deg')
-    vals.append(params_init['rot_pa_deg'])
-    lows.append(bounds['rot_pa_deg'][0])
-    highs.append(bounds['rot_pa_deg'][1])
-
-    return keys, np.array(vals), np.array(lows), np.array(highs)
+    return keys, np.clip(np.array(x_raw), 0.0, 1.0), phys_lows, phys_highs
 
 
-def _flat_to_params(x, keys, cfg, vals=None, bounds=None):
-    """Convert flat vector back to parameter dict."""
-    if bounds is None:
-        bounds = {}
+def _flat_to_params(x, keys, cfg, phys_lows=None, phys_highs=None):
+    """Convert flat [0,1] vector back to parameter dict.
+
+    Maps each dimension from [0,1] to physical space:
+        val = x_01 * (phys_high - phys_low) + phys_low
+    """
     p = {}
     idx = 0
 
-    p['rho0'] = np.exp(x[idx]); idx += 1
-    p['r0'] = np.exp(x[idx]); idx += 1
-    p['alpha'] = x[idx]; idx += 1
-    p['T0'] = np.exp(x[idx]); idx += 1
-    p['T1'] = np.exp(x[idx]); idx += 1
-    p['rT'] = np.exp(x[idx]); idx += 1
+    def _next():
+        nonlocal idx
+        v = x[idx]; idx += 1
+        return v
 
-    # Check if using direct f_HI mode
+    def _to_phys(v01, i):
+        """Map [0,1] → physical space."""
+        if phys_lows is not None and phys_highs is not None:
+            return v01 * (phys_highs[i] - phys_lows[i]) + phys_lows[i]
+        return v01
+
+    p['rho0'] = _to_phys(_next(), idx - 1); 
+    p['r0'] = _to_phys(_next(), idx - 1)
+    p['alpha'] = _to_phys(_next(), idx - 1)
+    p['T0'] = _to_phys(_next(), idx - 1)
+    p['T1'] = _to_phys(_next(), idx - 1)
+    p['rT'] = _to_phys(_next(), idx - 1)
+
+    # Abundance: direct f_HI or peak_shell + multipliers
     if keys[idx].startswith('f_HI_'):
-        f_hi_lo, f_hi_hi = bounds.get('f_HI', cfg.bounds_pc['f_HI'])
         f_HI = np.zeros(cfg.n_shells)
         for i in range(cfg.n_shells):
-            f_HI[i] = np.clip(np.exp(x[idx]), f_hi_lo, f_hi_hi)
-            idx += 1
+            f_HI[i] = np.clip(_to_phys(_next(), idx - 1), 1e-10, 0.5)
         p['f_HI'] = f_HI
     else:
         if keys[idx] == '_fixed_peak_shell':
-            p['peak_shell'] = int(vals[idx]) if vals is not None else cfg.default_params['peak_shell']
+            p['peak_shell'] = int(phys_lows[idx]) if phys_lows is not None else cfg.default_params['peak_shell']
             idx += 1
         else:
-            p['peak_shell'] = int(round(x[idx])); idx += 1
+            p['peak_shell'] = int(round(_to_phys(_next(), idx - 1)))
 
-        f_hp_lo, f_hp_hi = bounds.get('f_HI_peak', cfg.bounds_pc['f_HI_peak'])
         if keys[idx] == '_fixed_f_HI_peak':
-            p['f_HI_peak'] = float(np.exp(vals[idx])) if vals is not None else cfg.default_params['f_HI_peak']
+            p['f_HI_peak'] = float(phys_lows[idx]) if phys_lows is not None else cfg.default_params['f_HI_peak']
             idx += 1
         else:
-            p['f_HI_peak'] = float(np.clip(np.exp(x[idx]), f_hp_lo, f_hp_hi)); idx += 1
+            p['f_HI_peak'] = float(np.clip(_to_phys(_next(), idx - 1), 1e-10, 0.5))
 
-        mult_lo, mult_hi = bounds.get('multipliers', cfg.bounds_pc['multipliers'])
         n_mult = cfg.n_shells - 1
-        p['multipliers'] = np.clip(np.exp(x[idx:idx + n_mult]), mult_lo, mult_hi)
-        idx += n_mult
+        p['multipliers'] = np.clip(
+            np.array([_to_phys(_next(), idx - 1) for _ in range(n_mult)]),
+            0.01, 1.0)
+        # Note: idx is already advanced by the loop above
 
-    p['f_ff'] = np.exp(x[idx]); idx += 1
-    p['turb_kms'] = np.exp(x[idx]); idx += 1
-    p['v_offset'] = x[idx]; idx += 1
-    p['v_rot_kms'] = np.exp(x[idx]); idx += 1
-    p['rot_pa_deg'] = x[idx]; idx += 1
+    p['f_ff'] = np.clip(_to_phys(_next(), idx - 1), 1e-10, 0.5)
+    p['turb_kms'] = np.clip(_to_phys(_next(), idx - 1), 1e-10, 5.0)
+    p['v_offset'] = _to_phys(_next(), idx - 1)
+    p['v_rot_kms'] = np.clip(_to_phys(_next(), idx - 1), 0.0, 10.0)
+    p['rot_pa_deg'] = _to_phys(_next(), idx - 1)
 
     return p
 
