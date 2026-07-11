@@ -1065,14 +1065,11 @@ def _save_fit_diagnostic_png(png_path, cfg, params, model_cube,
     nHI_shell = n_H * f_HI * dr * pc_to_cm  # column density per shell (cm^-2)
 
     # Project onto 2D: NHI(R) = 2 * integral from R to R_out of nHI(r)/sqrt(r^2 - R^2) dr
-    # Use mid-radius of each shell as representative r
     r_s = r_mid
-    R_grid = np.linspace(0, r_s[-1], 50)  # projected radii
-    NHI_1d = np.zeros_like(R_grid)
-    for iR, R in enumerate(R_grid):
-        if R >= r_s[-1]:
-            NHI_1d[iR] = 0.0
-            continue
+    n_fine = 500
+    R_grid_fine = np.linspace(0, r_s[-1] * 0.999, n_fine)
+    NHI_1d = np.zeros_like(R_grid_fine)
+    for iR, R in enumerate(R_grid_fine):
         mask = r_s > R
         r_use = r_s[mask]
         n_use = nHI_shell[mask]
@@ -1081,11 +1078,17 @@ def _save_fit_diagnostic_png(png_path, cfg, params, model_cube,
         integrand = n_use / np.sqrt(sqrt_arg)
         NHI_1d[iR] = 2.0 * np.trapz(integrand, r_use)
 
-    # Build 2D map on pixel grid
+    # Build 2D map: compute on fine pixel grid then downsample
     ny, nx = obs_cube.shape[1], obs_cube.shape[2]
-    yy, xx = np.mgrid[0:ny, 0:nx]
-    R_pix = np.sqrt((xx - xc)**2 + (yy - yc)**2) * pixel_scale_pc
-    NHI_map = np.interp(R_pix.ravel(), R_grid, NHI_1d).reshape(ny, nx)
+    # Use 10x oversampled grid for smooth rendering
+    oversample = 10
+    yy_f, xx_f = np.mgrid[0:ny*oversample, 0:nx*oversample]
+    xc_f = xc * oversample + oversample // 2
+    yc_f = yc * oversample + oversample // 2
+    R_pix_f = np.sqrt((xx_f - xc_f)**2 + (yy_f - yc_f)**2) * pixel_scale_pc / oversample
+    NHI_fine = np.interp(R_pix_f.ravel(), R_grid_fine, NHI_1d).reshape(ny*oversample, nx*oversample)
+    # Downsample by averaging
+    NHI_map = NHI_fine.reshape(ny, oversample, nx, oversample).mean(axis=(1, 3))
 
     from matplotlib.colors import LogNorm
     NHI_pos = NHI_map[NHI_map > 0]
