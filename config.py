@@ -12,6 +12,10 @@ class Config:
     n_shells: int = 9
     R_out_pc: float = 5.        # total cloud radius in pc
 
+    # ---- Fitting weight ----
+    weight_index: float = 1.0   # exponent for radial weight: w = 1/r^weight_index
+                                # 0.0 = uniform, 0.5 = 1/sqrt(r), 1.0 = 1/r
+
     # ---- Physical constants (CGS) ----
     k_B = 1.380649e-16            # erg/K
     m_H = 1.6735e-24              # g
@@ -19,6 +23,7 @@ class Config:
     mu = 2.33                     # mean molecular weight
     G = 6.67430e-8                # cm^3 g^-1 s^-2
     pc_cm = 3.085677581e18        # cm/pc
+    M_sun_g = 1.989e33            # g, solar mass
 
     # ---- HI 21cm ----
     nu_21cm = 1.420405751e9       # Hz
@@ -27,9 +32,19 @@ class Config:
     h_planck = 6.62607015e-27     # erg·s
     T_cmb = 2.725                 # K, cosmic microwave background
 
+    # ---- Galactic HI foreground (Li & Goldsmith 2003) ----
+    tau_h_total: float = 0.0       # total galactic HI optical depth along LOS [SET IT TO ZERO TO 禁用 FOREGROUND]
+    T_HI_galactic: float = 100.0   # galactic HI spin temperature (K), CNM+WNM effective spin temperature, opacity-weighted.
+    p_min: float = 0.7             # minimum background fraction p (Li 2003 default)
+    galactic_HI_disk_fwhm_pc: float = 360.0  # Lockman 1984, used in Li 2003 eq.9
+
     # ---- Telescope ----
     beam_fwhm_arcmin: float = 4.0  # FAST HI beam
     distance_pc: float = 140.0     # default distance
+
+    # ---- FITS header fallback defaults ----
+    default_cdelt_deg: float = 0.025   # fallback pixel scale (degrees) when CDELT1/CDELT2 missing
+    default_cdelt3_ms: float = 200.0   # fallback velocity channel width (m/s) when CDELT3 missing
 
     # ---- Velocity channels ----
     v_min_kms: float = -20.0
@@ -79,6 +94,9 @@ class Config:
             setattr(self, k, v)
         # Auto-compute derived quantities
         self._build_shell_radii()
+        # Update peak_shell upper bound to match n_shells
+        self.bounds_pc = dict(self.__class__.bounds_pc)
+        self.bounds_pc['peak_shell'] = (1, max(1, self.n_shells))
 
     def _build_shell_radii(self):
         """Uniformly spaced shells from 0 to R_out."""

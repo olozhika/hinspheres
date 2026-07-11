@@ -14,15 +14,104 @@ from .profiles import (
 from .rt import (
     los_path_lengths, compute_layer_tau0,
     radiative_transfer_pixel, los_velocity,
-    inverse_radiative_transfer_pixel, inverse_radiative_transfer_pixel_iter,
+    inverse_radiative_transfer_pixel,
 )
 
 
+def _compute_galactic_b(fits_header, center_yx=None):
+    """Compute galactic latitude of cloud center from FITS header coordinates.
+
+    Parameters
+    ----------
+    fits_header : astropy.io.fits.Header
+        Must contain CRVAL1/CRVAL2 (RA/DEC in degrees) and CRPIX1/CRPIX2.
+    center_yx : tuple (yc, xc) or None
+        Cloud center pixel. If None, uses the FITS reference pixel position.
+
+    Returns
+    -------
+    b_deg : float — galactic latitude (degrees)
+    """
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+
+    crval1 = fits_header.get('CRVAL1', 0.0)
+    crval2 = fits_header.get('CRVAL2', 0.0)
+    crpix1 = fits_header.get('CRPIX1', 1.0)
+    crpix2 = fits_header.get('CRPIX2', 1.0)
+    cdelt1 = fits_header.get('CDELT1', 0.0)
+    cdelt2 = fits_header.get('CDELT2', 0.0)
+
+    if center_yx is not None:
+        yc, xc = center_yx
+        ra = crval1 + cdelt1 * (xc - (crpix1 - 1))
+        dec = crval2 + cdelt2 * (yc - (crpix2 - 1))
+    else:
+        ra, dec = crval1, crval2
+
+    coord = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame='icrs')
+    return coord.galactic.b.deg
+
+
+def compute_foreground_params(cfg, galactic_b_deg=None):
+    """Compute foreground optical depth and HI spin temperature from galactic model.
+
+    Uses Li & Goldsmith (2003) eq.9: p = erfc(sqrt(4*ln2) * D*sin(b) / z)
+    where z = 360 pc is the galactic HI disk FWHM.
+
+    Parameters
+    ----------
+    cfg : Config
+        Must have tau_h_total, T_HI_galactic, p_min, distance_pc.
+    galactic_b_deg : float or None
+        Galactic latitude (degrees). If None, raises ValueError.
+
+    Returns
+    -------
+    tau_fg : float — foreground HI optical depth
+    T_HI_galactic : float — foreground HI spin temperature (K)
+
+    Raises
+    ------
+    ValueError
+        If galactic_b_deg is None or cfg.distance_pc is invalid.
+    """
+    from scipy.special import erfc
+
+    if galactic_b_deg is None:
+        raise ValueError(
+            "Cannot determine galactic latitude: provide a FITS file with "
+            "RA/DEC coordinates, or pass galactic_b_deg explicitly.")
+    if cfg.distance_pc is None or cfg.distance_pc <= 0:
+        raise ValueError(
+            "Cannot determine cloud distance: set distance_pc in Config.")
+
+    D_kpc = cfg.distance_pc / 1000.0
+    b_rad = np.abs(galactic_b_deg) * np.pi / 180.0
+
+    # Li 2003 eq.9: galactic HI disk as Gaussian (Lockman 1984)
+    z_pc = cfg.galactic_HI_disk_fwhm_pc
+    sigma = z_pc / np.sqrt(8.0 * np.log(2.0))
+    arg = D_kpc * 1000.0 * np.sin(b_rad) / (sigma * np.sqrt(2.0))
+    p = erfc(arg)
+    p = max(p, cfg.p_min)
+
+    tau_fg = (1.0 - p) * cfg.tau_h_total
+    return tau_fg, cfg.T_HI_galactic
+
+
 def build_synthetic_hinsa(cfg, params, bg_cube, center_yx, pixel_scale_pc,
+                          galactic_b_deg=None,
                           R_out_pc=None, vlsr_kms=None, n_jobs=1):
     """Forward-model a synthetic HI cube with HINSA absorption.
 
     The output grid always matches the input bg_cube.
+
+    ``bg_cube`` is the **observed** HI brightness-temperature cube *without*
+    the cold cloud, i.e. it already contains both galactic foreground HI
+    emission and the background HI continuum.  Internally the foreground is
+    stripped before the cloud RT and re-applied afterwards, so the cloud
+    absorption acts on the *pure* background.
 
     Parameters
     ----------
@@ -30,14 +119,18 @@ def build_synthetic_hinsa(cfg, params, bg_cube, center_yx, pixel_scale_pc,
     params : dict
         Cloud model parameters.
     bg_cube : ndarray, shape (n_v, ny, nx) or (ny, nx)
-        Background HI brightness-temperature (K).
-        - 3D: velocity-dependent background.
+        Observed HI brightness-temperature (K) **without the cold cloud**,
+        i.e. the sum of foreground galactic HI emission and background HI.
+        - 3D: velocity-dependent.
         - 2D: broadcast to all velocities.
         - None: constant 30 K (shape derived from cfg).
     center_yx : tuple (yc, xc)
         Pixel position of cloud centre in the bg spatial grid.
     pixel_scale_pc : float
         Spatial pixel scale in pc/pixel.
+    galactic_b_deg : float or None
+        Galactic latitude (degrees). Required for foreground HI calculation.
+        If None, raises ValueError via compute_foreground_params.
     R_out_pc : float or None
         Override cloud outer radius (pc). If None, uses cfg.R_out_pc.
     vlsr_kms : float or None
@@ -47,7 +140,7 @@ def build_synthetic_hinsa(cfg, params, bg_cube, center_yx, pixel_scale_pc,
     Returns
     -------
     out_cube : 3D array (n_v, ny, nx)
-        Synthetic cube: background modified by cloud RT at each pixel.
+        Synthetic cube: foreground+background modified by cloud RT at each pixel.
     """
     # Temporarily override cfg if requested
     orig_R_out = cfg.R_out_pc
@@ -58,120 +151,143 @@ def build_synthetic_hinsa(cfg, params, bg_cube, center_yx, pixel_scale_pc,
     if vlsr_kms is not None:
         cfg.vlsr_kms = vlsr_kms
 
-    ns = cfg.n_shells
+    try:
+        ns = cfg.n_shells
 
-    # --- 1. Radial profiles ---
-    n_HI, T_spin, sigma_v, v_infall_kms = compute_radial_profiles(cfg, params)
+        # --- 1. Radial profiles ---
+        n_HI, T_spin, sigma_v, v_infall_kms = compute_radial_profiles(cfg, params)
 
-    # --- 2. Determine grid from bg_cube ---
-    if bg_cube is not None and np.any(np.isfinite(bg_cube)):
-        if bg_cube.ndim == 3:
-            n_v, ny, nx = bg_cube.shape
+        # --- 2. Determine grid from bg_cube ---
+        if bg_cube is not None and np.any(np.isfinite(bg_cube)):
+            if bg_cube.ndim == 3:
+                n_v, ny, nx = bg_cube.shape
+            else:
+                ny, nx = bg_cube.shape
+                n_v = cfg.n_v_channels
         else:
-            ny, nx = bg_cube.shape
+            # No background: build grid from cfg
+            npix = int(2 * cfg.R_out_pc / cfg.pc_per_pix) + 1
+            npix = max(npix, 3) | 1
+            ny = nx = npix
             n_v = cfg.n_v_channels
-    else:
-        # No background: build grid from cfg
-        npix = int(2 * cfg.R_out_pc / cfg.pc_per_pix) + 1
-        npix = max(npix, 3) | 1
-        ny = nx = npix
-        n_v = cfg.n_v_channels
 
-    v_grid = np.linspace(cfg.v_min_kms, cfg.v_max_kms, n_v)
-    yc, xc = center_yx
+        v_grid = np.linspace(cfg.v_min_kms, cfg.v_max_kms, n_v)
+        yc, xc = center_yx
 
-    # --- 3. Build background array ---
-    bg_is_3d = False
-    T_bg_3d = None
-    T_bg_2d = None
+        # --- 3. Build background array ---
+        # bg_cube contains foreground+background; subtract foreground to get
+        # the pure background that the cloud RT should act on.
+        bg_is_3d = False
+        T_bg_3d = None
+        T_bg_2d = None
 
-    if bg_cube is not None and np.any(np.isfinite(bg_cube)):
-        if bg_cube.ndim == 3:
-            bg_is_3d = True
-            T_bg_3d = bg_cube.astype(np.float64)
+        if bg_cube is not None and np.any(np.isfinite(bg_cube)):
+            if bg_cube.ndim == 3:
+                bg_is_3d = True
+                T_bg_3d = bg_cube.astype(np.float64)
+            else:
+                T_bg_2d = bg_cube.astype(np.float64)
         else:
-            T_bg_2d = bg_cube.astype(np.float64)
-    else:
-        T_bg_2d = np.full((ny, nx), 30.0)
+            T_bg_2d = np.full((ny, nx), 30.0)
 
-    tau_bg = 0.1
-    tau_fg = 0.02
+        # --- Foreground HI from galactic model (Li & Goldsmith 2003) ---
+        tau_fg, T_HI_gal = compute_foreground_params(cfg, galactic_b_deg)
+        exp_neg_tau_fg = np.exp(-tau_fg)
+        T_fg_emission = T_HI_gal * (1.0 - exp_neg_tau_fg)
 
-    v_offset = params.get('v_offset', 0.0)
-    v_rot_kms = params.get('v_rot_kms', 0.0)
-    rot_pa_deg = params.get('rot_pa_deg', 0.0)
+        # Strip foreground: T_bg_clean = (T_obs - T_fg_emission) / exp(-tau_fg)
+        if tau_fg > 0 and exp_neg_tau_fg > 0:
+            if bg_is_3d:
+                T_bg_3d = (T_bg_3d - T_fg_emission) / exp_neg_tau_fg
+            elif T_bg_2d is not None:
+                T_bg_2d = (T_bg_2d - T_fg_emission) / exp_neg_tau_fg
 
-    r_outer = cfg.r_outer
-    r_mid = cfg.r_mid
-    pc_cm = cfg.pc_cm
+        v_offset = params.get('v_offset', 0.0)
+        v_rot_kms = params.get('v_rot_kms', 0.0)
+        rot_pa_deg = params.get('rot_pa_deg', 0.0)
 
-    # --- 4. Impact-parameter map ---
-    yy, xx = np.mgrid[0:ny, 0:nx]
-    dx_map = (xx - xc).astype(float) * pixel_scale_pc
-    b_map = np.sqrt(dx_map**2 + ((yy - yc).astype(float) * pixel_scale_pc)**2)
+        r_outer = cfg.r_outer
+        r_mid = cfg.r_mid
+        pc_cm = cfg.pc_cm
 
-    # --- 5. Ray-trace per pixel ---
-    out_cube = np.empty((n_v, ny, nx), dtype=np.float64)
+        # --- 4. Impact-parameter map ---
+        yy, xx = np.mgrid[0:ny, 0:nx]
+        dx_map = (xx - xc).astype(float) * pixel_scale_pc
+        dy_map = (yy - yc).astype(float) * pixel_scale_pc
+        b_map = np.sqrt(dx_map**2 + dy_map**2)
 
-    def _compute_pixel(j, i):
-        b = b_map[j, i]
-        dx = dx_map[j, i]
+        # --- 5. Ray-trace per pixel ---
+        out_cube = np.empty((n_v, ny, nx), dtype=np.float64)
 
-        if bg_is_3d:
-            T_bg_spec = T_bg_3d[:, j, i]
-        else:
-            T_bg_spec = T_bg_2d[j, i]
+        def _compute_pixel(j, i):
+            b = b_map[j, i]
+            dx = dx_map[j, i]
+            dy = dy_map[j, i]
 
-        if b >= r_outer[-1]:
-            return T_bg_spec.copy() if bg_is_3d else np.full(n_v, T_bg_spec)
+            if bg_is_3d:
+                T_bg_spec = T_bg_3d[:, j, i]
+            else:
+                T_bg_spec = T_bg_2d[j, i]
 
-        layers = los_path_lengths(b, r_outer, ns)
-        if not layers:
-            return T_bg_spec.copy() if bg_is_3d else np.full(n_v, T_bg_spec)
+            if b >= r_outer[-1]:
+                return T_bg_spec.copy() if bg_is_3d else np.full(n_v, T_bg_spec)
 
-        n_layer = len(layers)
-        tau0_arr = np.zeros(n_layer)
-        v_center_arr = np.zeros(n_layer)
-        sigma_arr = np.zeros(n_layer)
-        T_s_arr = np.zeros(n_layer)
+            layers = los_path_lengths(b, r_outer, ns)
+            if not layers:
+                return T_bg_spec.copy() if bg_is_3d else np.full(n_v, T_bg_spec)
 
-        for il, (k, dl, z) in enumerate(layers):
-            tau0_arr[il] = compute_layer_tau0(n_HI[k], T_spin[k], dl,
-                                               sigma_v[k], pc_cm)
-            v_los = los_velocity(b, z, r_mid, v_infall_kms,
-                                 v_rot_kms=v_rot_kms, rot_pa_deg=rot_pa_deg,
-                                 dx=dx)
-            v_center_arr[il] = v_los + cfg.vlsr_kms + v_offset
-            sigma_arr[il] = sigma_v[k]
-            T_s_arr[il] = T_spin[k]
+            n_layer = len(layers)
+            tau0_arr = np.zeros(n_layer)
+            v_center_arr = np.zeros(n_layer)
+            sigma_arr = np.zeros(n_layer)
+            T_s_arr = np.zeros(n_layer)
 
-        T_fg = np.mean(T_bg_spec) if bg_is_3d else T_bg_spec
-        T_B = radiative_transfer_pixel(
-            v_grid, n_layer, tau0_arr, v_center_arr,
-            sigma_arr, T_s_arr, T_bg_spec, T_fg, tau_bg, tau_fg
+            for il, (k, dl, z) in enumerate(layers):
+                tau0_arr[il] = compute_layer_tau0(cfg, n_HI[k], T_spin[k], dl,
+                                                   sigma_v[k])
+                v_los = los_velocity(b, z, r_mid, v_infall_kms,
+                                     v_rot_kms=v_rot_kms, rot_pa_deg=rot_pa_deg,
+                                     dx=dx, dy=dy, r_cloud=r_outer[-1])
+                v_center_arr[il] = v_los + cfg.vlsr_kms + v_offset
+                sigma_arr[il] = sigma_v[k]
+                T_s_arr[il] = T_spin[k]
+
+            # --- 6. Forward RT per pixel ---
+            # radiative_transfer_pixel does cloud RT only (no foreground).
+            # Foreground is applied uniformly to the full cube afterwards.
+            T_B = radiative_transfer_pixel(
+                    v_grid, n_layer, tau0_arr, v_center_arr,
+                    sigma_arr, T_s_arr, T_bg_spec
+                )
+            return T_B
+
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(_compute_pixel)(j, i)
+            for j in range(ny) for i in range(nx)
         )
-        return T_B
 
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(_compute_pixel)(j, i)
-        for j in range(ny) for i in range(nx)
-    )
+        for idx, (j, i) in enumerate(
+                [(j, i) for j in range(ny) for i in range(nx)]):
+            out_cube[:, j, i] = results[idx]
 
-    for idx, (j, i) in enumerate(
-            [(j, i) for j in range(ny) for i in range(nx)]):
-        out_cube[:, j, i] = results[idx]
+        # Apply foreground HI uniformly to the entire cube.
+        # out_cube currently contains cloud-RT(pure background).
+        # Apply: T_obs = T_cloud * exp(-tau_fg) + T_fg * (1 - exp(-tau_fg))
+        out_cube *= exp_neg_tau_fg
+        out_cube += T_fg_emission
 
-    # Restore cfg
-    cfg.R_out_pc = orig_R_out
-    cfg._build_shell_radii()
-    cfg.vlsr_kms = orig_vlsr
+    finally:
+        # Restore cfg
+        cfg.R_out_pc = orig_R_out
+        cfg._build_shell_radii()
+        cfg.vlsr_kms = orig_vlsr
 
     return out_cube
 
 
 def inverse_build_hinsa_cube(cfg, params, obs_cube, center_yx, pixel_scale_pc,
-                              R_out_pc=None, vlsr_kms=None, n_jobs=1,
-                              method='simple'):
+                              galactic_b_deg=None,
+                              R_out_pc=None, vlsr_kms=None, n_jobs=1):
     """Inverse RT: from observed cube, recover reconstructed background T_bg.
 
     Uses the physical model to compute tau at each pixel, then inverts
@@ -184,10 +300,11 @@ def inverse_build_hinsa_cube(cfg, params, obs_cube, center_yx, pixel_scale_pc,
     obs_cube : ndarray, shape (n_v, ny, nx) — observed HI cube
     center_yx : tuple (yc, xc)
     pixel_scale_pc : float — pc/pixel
+    galactic_b_deg : float or None
+        Galactic latitude (degrees). Required for foreground stripping.
     R_out_pc : float or None
     vlsr_kms : float or None
     n_jobs : int
-    method : str — 'simple' (direct inverse) or 'iterative' (Liu Method 2)
 
     Returns
     -------
@@ -201,82 +318,93 @@ def inverse_build_hinsa_cube(cfg, params, obs_cube, center_yx, pixel_scale_pc,
     if vlsr_kms is not None:
         cfg.vlsr_kms = vlsr_kms
 
-    ns = cfg.n_shells
-    n_v, ny, nx = obs_cube.shape
-    v_grid = np.linspace(cfg.v_min_kms, cfg.v_max_kms, n_v)
-    yc, xc = center_yx
+    try:
+        ns = cfg.n_shells
+        n_v, ny, nx = obs_cube.shape
+        v_grid = np.linspace(cfg.v_min_kms, cfg.v_max_kms, n_v)
+        yc, xc = center_yx
 
-    # --- Radial profiles ---
-    n_HI, T_spin, sigma_v, v_infall_kms = compute_radial_profiles(cfg, params)
+        # --- Radial profiles ---
+        n_HI, T_spin, sigma_v, v_infall_kms = compute_radial_profiles(cfg, params)
 
-    v_offset = params.get('v_offset', 0.0)
-    v_rot_kms = params.get('v_rot_kms', 0.0)
-    rot_pa_deg = params.get('rot_pa_deg', 0.0)
+        v_offset = params.get('v_offset', 0.0)
+        v_rot_kms = params.get('v_rot_kms', 0.0)
+        rot_pa_deg = params.get('rot_pa_deg', 0.0)
 
-    r_outer = cfg.r_outer
-    r_mid = cfg.r_mid
-    pc_cm = cfg.pc_cm
+        # --- Foreground HI from galactic model ---
+        tau_fg, T_HI_gal = compute_foreground_params(cfg, galactic_b_deg)
+        exp_neg_tau_fg = np.exp(-tau_fg)
 
-    # --- Impact-parameter map ---
-    yy, xx = np.mgrid[0:ny, 0:nx]
-    dx_map = (xx - xc).astype(float) * pixel_scale_pc
-    b_map = np.sqrt(dx_map**2 + ((yy - yc).astype(float) * pixel_scale_pc)**2)
+        r_outer = cfg.r_outer
+        r_mid = cfg.r_mid
+        pc_cm = cfg.pc_cm
 
-    # --- Inverse RT per pixel ---
-    T_bg_cube = np.empty((n_v, ny, nx), dtype=np.float64)
+        # --- Impact-parameter map ---
+        yy, xx = np.mgrid[0:ny, 0:nx]
+        dx_map = (xx - xc).astype(float) * pixel_scale_pc
+        dy_map = (yy - yc).astype(float) * pixel_scale_pc
+        b_map = np.sqrt(dx_map**2 + dy_map**2)
 
-    def _compute_pixel(j, i):
-        b = b_map[j, i]
-        dx = dx_map[j, i]
-        T_obs_spec = obs_cube[:, j, i].astype(np.float64)
+        # --- Inverse RT per pixel ---
+        T_bg_cube = np.empty((n_v, ny, nx), dtype=np.float64)
 
-        if b >= r_outer[-1]:
-            return T_obs_spec.copy()
+        def _compute_pixel(j, i):
+            b = b_map[j, i]
+            dx = dx_map[j, i]
+            dy = dy_map[j, i]
+            T_obs_spec = obs_cube[:, j, i].astype(np.float64)
 
-        layers = los_path_lengths(b, r_outer, ns)
-        if not layers:
-            return T_obs_spec.copy()
+            # [Fix] Step 1: strip foreground HI FIRST (closest to observer)
+            T_after_fg = (T_obs_spec - T_HI_gal * (1.0 - exp_neg_tau_fg)) / exp_neg_tau_fg
 
-        n_layer = len(layers)
-        tau0_arr = np.zeros(n_layer)
-        v_center_arr = np.zeros(n_layer)
-        sigma_arr = np.zeros(n_layer)
-        T_s_arr = np.zeros(n_layer)
+            if b >= r_outer[-1]:
+                return T_after_fg
 
-        for il, (k, dl, z) in enumerate(layers):
-            tau0_arr[il] = compute_layer_tau0(n_HI[k], T_spin[k], dl,
-                                               sigma_v[k], pc_cm)
-            v_los = los_velocity(b, z, r_mid, v_infall_kms,
-                                 v_rot_kms=v_rot_kms, rot_pa_deg=rot_pa_deg,
-                                 dx=dx)
-            v_center_arr[il] = v_los + cfg.vlsr_kms + v_offset
-            sigma_arr[il] = sigma_v[k]
-            T_s_arr[il] = T_spin[k]
+            layers = los_path_lengths(b, r_outer, ns)
+            if not layers:
+                return T_after_fg
 
-        # Inverse RT: peel back layers to recover T_bg
-        if method == 'iterative':
-            T_bg = inverse_radiative_transfer_pixel_iter(
-                v_grid, n_layer, tau0_arr, v_center_arr,
-                sigma_arr, T_s_arr, T_obs_spec)
-        else:
+            n_layer = len(layers)
+            tau0_arr = np.zeros(n_layer)
+            v_center_arr = np.zeros(n_layer)
+            sigma_arr = np.zeros(n_layer)
+            T_s_arr = np.zeros(n_layer)
+
+            for il, (k, dl, z) in enumerate(layers):
+                tau0_arr[il] = compute_layer_tau0(cfg, n_HI[k], T_spin[k], dl,
+                                                   sigma_v[k])
+                v_los = los_velocity(b, z, r_mid, v_infall_kms,
+                                     v_rot_kms=v_rot_kms, rot_pa_deg=rot_pa_deg,
+                                     dx=dx, dy=dy, r_cloud=r_outer[-1])
+                v_center_arr[il] = v_los + cfg.vlsr_kms + v_offset
+                sigma_arr[il] = sigma_v[k]
+                T_s_arr[il] = T_spin[k]
+
+            # [Fix] Step 2: peel back cloud layers using foreground-stripped spectrum
             T_bg = inverse_radiative_transfer_pixel(
                 v_grid, n_layer, tau0_arr, v_center_arr,
-                sigma_arr, T_s_arr, T_obs_spec)
-        return T_bg
+                sigma_arr, T_s_arr, T_after_fg)
+            # Physical guard: clamp reconstructed T_bg to reasonable range.
+            # For HI observations Tb is typically 5-100 K; allow up to 3x
+            # the observed max to avoid unphysical blow-up from noisy channels.
+            T_max = float(np.max(T_obs_spec)) * 3.0 + 50.0
+            np.clip(T_bg, 0.0, T_max, out=T_bg)
+            return T_bg
 
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(_compute_pixel)(j, i)
-        for j in range(ny) for i in range(nx)
-    )
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(_compute_pixel)(j, i)
+            for j in range(ny) for i in range(nx)
+        )
 
-    for idx, (j, i) in enumerate(
-            [(j, i) for j in range(ny) for i in range(nx)]):
-        T_bg_cube[:, j, i] = results[idx]
+        for idx, (j, i) in enumerate(
+                [(j, i) for j in range(ny) for i in range(nx)]):
+            T_bg_cube[:, j, i] = results[idx]
 
-    # Restore cfg
-    cfg.R_out_pc = orig_R_out
-    cfg._build_shell_radii()
-    cfg.vlsr_kms = orig_vlsr
+    finally:
+        # Restore cfg
+        cfg.R_out_pc = orig_R_out
+        cfg._build_shell_radii()
+        cfg.vlsr_kms = orig_vlsr
 
     return T_bg_cube
 
@@ -291,15 +419,15 @@ def compute_enclosed_mass(n_H, cfg):
     for k in range(cfg.n_shells):
         n_k = n_H[k]
         vol = cfg.shell_vol[k]
-        mass_cum_g += n_k * cfg.m_H2 * (vol * cfg.pc_cm**3)
-        M_enc[k] = mass_cum_g / (2.0 * 1.989e33)  # M_sun
+        mass_cum_g += n_k * cfg.m_H * (vol * cfg.pc_cm**3)
+        M_enc[k] = mass_cum_g / cfg.M_sun_g  # M_sun
     return M_enc
 
 
 def compute_radial_profiles(cfg, params):
     """Compute shell-by-shell physical profiles from parameters.
 
-    Returns (n_HI, T_spin, sigma_v, v_infall_kms, M_enc) all as 1-D arrays.
+    Returns (n_HI, T_spin, sigma_v, v_infall_kms) all as 1-D arrays.
     """
     n_H = density_plummer(cfg.r_mid, params['rho0'], params['r0'], params['alpha'])
     T = temperature_plummer(cfg.r_mid, params['T0'], params['T1'], params['rT'])
@@ -315,16 +443,17 @@ def compute_radial_profiles(cfg, params):
     M_enc = compute_enclosed_mass(n_H, cfg)
     v_infall_kms = infall_velocity(
         cfg.r_mid * cfg.pc_cm, cfg.r_outer * cfg.pc_cm,
-        params['f_ff'], M_enc, cfg.G, 1.989e33
+        params['f_ff'], M_enc, cfg.G, cfg.M_sun_g
     ) / 1e5
 
-    sigma_thermal = np.sqrt(cfg.k_B * T / (cfg.m_H * cfg.mu)) / 1e5
+    sigma_thermal = np.sqrt(cfg.k_B * T / cfg.m_H) / 1e5
     sigma_v = np.sqrt(sigma_thermal**2 + params['turb_kms']**2)
 
     return n_HI, T_spin, sigma_v, v_infall_kms
 
 
-def synthetic_spectrum_at_pixel(cfg, params, b_pc, v_grid_kms, T_bg):
+def synthetic_spectrum_at_pixel(cfg, params, b_pc, v_grid_kms, T_bg,
+                                galactic_b_deg=None):
     """Compute the full HI spectrum at a single impact parameter.
 
     Parameters
@@ -335,6 +464,8 @@ def synthetic_spectrum_at_pixel(cfg, params, b_pc, v_grid_kms, T_bg):
     v_grid_kms : 1-D array — velocity channels (km/s)
     T_bg : float or 1-D array — background HI brightness temperature (K).
         If 1D array, must have same length as v_grid_kms.
+    galactic_b_deg : float or None
+        Galactic latitude (degrees). Required for foreground calculation.
 
     Returns
     -------
@@ -343,6 +474,8 @@ def synthetic_spectrum_at_pixel(cfg, params, b_pc, v_grid_kms, T_bg):
     n_HI, T_spin, sigma_v, v_infall_kms = compute_radial_profiles(cfg, params)
     ns = cfg.n_shells
     v_offset = params.get('v_offset', 0.0)
+    v_rot_kms = params.get('v_rot_kms', 0.0)
+    rot_pa_deg = params.get('rot_pa_deg', 0.0)
 
     if b_pc > cfg.r_outer[-1]:
         if np.ndim(T_bg) == 0:
@@ -364,19 +497,19 @@ def synthetic_spectrum_at_pixel(cfg, params, b_pc, v_grid_kms, T_bg):
     T_s_arr = np.zeros(n_layer)
 
     for il, (k, dl, z) in enumerate(layers):
-        tau0_arr[il] = compute_layer_tau0(n_HI[k], T_spin[k], dl,
-                                           sigma_v[k], cfg.pc_cm)
-        v_los = los_velocity(b_pc, z, cfg.r_mid, v_infall_kms)
+        tau0_arr[il] = compute_layer_tau0(cfg, n_HI[k], T_spin[k], dl,
+                                           sigma_v[k])
+        v_los = los_velocity(b_pc, z, cfg.r_mid, v_infall_kms,
+                             v_rot_kms=v_rot_kms, rot_pa_deg=rot_pa_deg,
+                             r_cloud=cfg.r_outer[-1])
         v_center_arr[il] = v_los + cfg.vlsr_kms + v_offset  # observed frame
         sigma_arr[il] = sigma_v[k]
         T_s_arr[il] = T_spin[k]
 
-    tau_bg = 0.1
-    tau_fg = 0.02
-    T_fg_scalar = np.mean(T_bg) if np.ndim(T_bg) > 0 else T_bg
+    tau_fg, T_HI_gal = compute_foreground_params(cfg, galactic_b_deg)
     T_B = radiative_transfer_pixel(
         v_grid_kms, n_layer, tau0_arr, v_center_arr,
-        sigma_arr, T_s_arr, T_bg, T_fg_scalar, tau_bg, tau_fg
+        sigma_arr, T_s_arr, T_bg, T_HI_gal, tau_fg
     )
     return T_B
 
@@ -426,12 +559,13 @@ def residual_map(obs_map, model_map, weights=None):
 
 
 def generate_sim_hinsa(output_path, background=None, center_pixel=None,
+                       galactic_b_deg=None,
                        vlsr_kms=None, R_out_pc=None, distance_pc=None,
-                       rho0=500, r0=0.05, alpha=1.0,
-                       T0=10.0, T1=40.0, rT=0.15,
-                       peak_shell=1, f_HI_peak=1.0, multipliers=None,
+                       rho0=5000.0, r0=0.1, alpha=2.0,
+                       T0=10.0, T1=58.0, rT=0.1,
+                       peak_shell=9, f_HI_peak=0.05, multipliers=None,
                        abundance=None,
-                       f_ff=0.1, turb_kms=0.15, v_offset=0.0,
+                       f_ff=0.1, turb_kms=0.2, v_offset=0.0,
                        v_rot_kms=0.0, rot_pa_deg=0.0,
                        spatial_res_pc=None, vel_res_kms=None,
                        n_shells=9, n_jobs=1, verbose=True):
@@ -439,6 +573,9 @@ def generate_sim_hinsa(output_path, background=None, center_pixel=None,
 
     Supports two modes:
     1. FITS background: place cloud in front of a real HI brightness-T cube.
+       The FITS is the observed HI **without the cold cloud** (foreground +
+       background combined).  Foreground is stripped internally before cloud
+       RT and re-applied afterwards.
     2. Constant background: generate a uniform-T background cube automatically.
 
     Parameters
@@ -446,10 +583,18 @@ def generate_sim_hinsa(output_path, background=None, center_pixel=None,
     output_path : str
         Path for the output FITS file.
     background : str or None
-        Path to a background HI brightness-temperature FITS cube (n_v, ny, nx).
+        Path to a HI brightness-temperature FITS cube (n_v, ny, nx) that
+        represents the observed sky **without the cold cloud** — i.e. the
+        combined foreground galactic HI emission and background HI.
+        The foreground is automatically stripped, cloud RT is applied to the
+        pure background, and the foreground is re-applied to the output.
         If None, a constant-background cube is generated automatically.
     center_pixel : tuple (yc, xc) or None
         Cloud center pixel in the background cube. If None, uses cube center.
+    galactic_b_deg : float or None
+        Galactic latitude (degrees). If None and background FITS is provided,
+        extracted from FITS header coordinates. If None and no FITS (constant
+        background mode), raises ValueError.
     vlsr_kms : float or None
         Cloud systemic velocity (km/s). If None, defaults to 0.
     R_out_pc : float or None
@@ -524,6 +669,12 @@ def generate_sim_hinsa(output_path, background=None, center_pixel=None,
         if verbose:
             print(f"Background FITS: {bg_cube.shape}")
 
+        # Extract galactic latitude from FITS header if not provided
+        if galactic_b_deg is None:
+            galactic_b_deg = _compute_galactic_b(bg_hdr, center_yx=center_pixel)
+            if verbose:
+                print(f"  Galactic b = {galactic_b_deg:.2f} deg (from FITS header)")
+
         # Extract velocity axis from FITS header
         crval3 = bg_hdr.get('CRVAL3', 0.0)
         cdelt3 = bg_hdr.get('CDELT3', -200.0)
@@ -531,10 +682,10 @@ def generate_sim_hinsa(output_path, background=None, center_pixel=None,
         velo_kms = (crval3 + (np.arange(n_v) - (crpix3 - 1)) * cdelt3) / 1000.0
 
         # Pixel scale
-        cdelt1 = abs(bg_hdr.get('CDELT1', 0.025))
-        cdelt2 = abs(bg_hdr.get('CDELT2', 0.025))
+        cdelt1 = abs(bg_hdr.get('CDELT1', Config.default_cdelt_deg))
+        cdelt2 = abs(bg_hdr.get('CDELT2', Config.default_cdelt_deg))
         if distance_pc is None:
-            distance_pc = 140.0
+            distance_pc = Config.distance_pc
         pix_scale_rad = np.sqrt(cdelt1 * cdelt2) * np.pi / 180.0
         pixel_scale_pc = pix_scale_rad * distance_pc
 
@@ -558,15 +709,21 @@ def generate_sim_hinsa(output_path, background=None, center_pixel=None,
         if verbose:
             print("Mode: constant background (no FITS input)")
 
+        if galactic_b_deg is None:
+            raise ValueError(
+                "Constant background mode requires galactic_b_deg (degrees). "
+                "No FITS coordinates available to auto-detect.")
+
         if distance_pc is None:
-            distance_pc = 140.0
+            from .config import Config
+            distance_pc = Config.distance_pc
         if R_out_pc is None:
-            R_out_pc = 0.91
+            R_out_pc = Config.R_out_pc
 
         vlsr_val = vlsr_kms if vlsr_kms is not None else 0.0
-        v_min = vlsr_val - 15.0
-        v_max = vlsr_val + 15.0
-        n_v = 301
+        v_min = vlsr_val - (Config.v_max_kms - Config.v_min_kms) / 2.0
+        v_max = vlsr_val + (Config.v_max_kms - Config.v_min_kms) / 2.0
+        n_v = Config.n_v_channels
         velo_kms = np.linspace(v_min, v_max, n_v)
 
         pixel_scale_pc = R_out_pc * 2.0 / 21.0
@@ -624,8 +781,39 @@ def generate_sim_hinsa(output_path, background=None, center_pixel=None,
         print(f"Forward-modeling {ny}x{nx} pixels ...")
 
     out_cube = build_synthetic_hinsa(
-        cfg, params, bg_cube, (yc, xc), pixel_scale_pc, n_jobs=n_jobs
+        cfg, params, bg_cube, (yc, xc), pixel_scale_pc,
+        galactic_b_deg=galactic_b_deg, n_jobs=n_jobs
     )
+
+    # --- Compute optical depth range at center pixel ---
+    n_HI, T_spin, sigma_v, v_infall = compute_radial_profiles(cfg, params)
+    layers_center = los_path_lengths(0.0, cfg.r_outer, cfg.n_shells)
+    if layers_center:
+        tau_center = [compute_layer_tau0(cfg, n_HI[k], T_spin[k], dl, sigma_v[k])
+                      for k, dl, z in layers_center]
+        tau_total_center = sum(tau_center)
+        tau_max_layer = max(tau_center)
+    else:
+        tau_total_center = 0.0
+        tau_max_layer = 0.0
+
+    # Also compute at 1-pixel offset for context
+    b1 = pixel_scale_pc
+    layers_1px = los_path_lengths(b1, cfg.r_outer, cfg.n_shells)
+    if layers_1px:
+        tau_1px = [compute_layer_tau0(cfg, n_HI[k], T_spin[k], dl, sigma_v[k])
+                   for k, dl, z in layers_1px]
+        tau_total_1px = sum(tau_1px)
+    else:
+        tau_total_1px = 0.0
+
+    if verbose:
+        print(f"Optical depth (center):  total={tau_total_center:.3f}, max_layer={tau_max_layer:.3f}")
+        print(f"Optical depth (1px off): total={tau_total_1px:.3f}")
+        if tau_max_layer > 3.0:
+            print(f"  WARNING: max layer tau > 3 — inverse RT (second_derivative mode) will be unreliable")
+        elif tau_total_center > 5.0:
+            print(f"  WARNING: total center tau > 5 — inverse RT may be noisy at line center")
 
     # --- Spatial + velocity smoothing ---
     if spatial_res_pc is not None or vel_res_kms is not None:
@@ -750,6 +938,9 @@ def generate_sim_hinsa(output_path, background=None, center_pixel=None,
         'cfg': cfg,
         'params': params,
         'hdr': out_hdr,
+        'tau_total_center': tau_total_center,
+        'tau_max_layer': tau_max_layer,
+        'tau_total_1px': tau_total_1px,
     }
 
 
@@ -814,8 +1005,8 @@ def _save_diagnostic_png(png_path, cfg, params, out_cube, velo_kms,
     # 6. Spectrum at center pixel
     spec_obs = out_cube[:, yc, xc].astype(float)
     spec_bg = bg_cube[:, yc, xc].astype(float)
-    axes[1, 2].plot(velo_kms, spec_bg, 'gray', alpha=0.5, label='Background')
-    axes[1, 2].plot(velo_kms, spec_obs, 'k', label='Cloud+BG')
+    axes[1, 2].plot(velo_kms, spec_bg, 'gray', alpha=0.5, label='Obs (no cloud)')
+    axes[1, 2].plot(velo_kms, spec_obs, 'k', label='Cloud model')
     axes[1, 2].axvline(v_center, color='red', ls='--', alpha=0.5, label=f'Vlsr+voff={v_center:.1f}')
     axes[1, 2].set_xlabel('v (km/s)')
     axes[1, 2].set_ylabel('T_B (K)')

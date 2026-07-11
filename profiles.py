@@ -70,9 +70,6 @@ def density_from_column(r_mid, r_outer, column_density_profile,
                 if k > 0 and b < r_outer[k-1]:
                     dl -= 2.0 * np.sqrt(max(0, r_outer[k-1]**2 - b**2))
                 tau += dens * dl
-            elif k == 0 and b < r_outer[0]:
-                dl = 2.0 * np.sqrt(r_outer[0]**2 - b**2)
-                tau += dens * dl
         n_H_norm[ib] = tau * pc_cm  # column density for unit central density
 
     # Scale factor from least-squares

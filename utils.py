@@ -86,7 +86,7 @@ def diagnostic_plot(cfg, params, obs_map, model_map, save_path=None):
     r = np.linspace(0, cfg.R_out_pc, 100)
     n_H = density_plummer(r, params['rho0'], params['r0'], params['alpha'])
     T = temperature_plummer(r, params['T0'], params['T1'], params['rT'])
-    ax_t = axes[1, 1].twinx() if True else axes[1, 1]
+    ax_t = axes[1, 1].twinx()
     axes[1, 1].plot(r, n_H, 'b-', label='n_H')
     axes[1, 1].set_ylabel('n_H (cm^-3)', color='b')
     ax_t.plot(r, T, 'r-', label='T')
@@ -96,12 +96,16 @@ def diagnostic_plot(cfg, params, obs_map, model_map, save_path=None):
 
     # HI abundance profile
     from .profiles import abundance_profile_111n
-    f_HI = abundance_profile_111n(cfg.n_shells, params['peak_shell'],
-                                   params['multipliers'],
-                                   f_HI_peak=params.get('f_HI_peak', 1.0))
+    if 'f_HI' in params:
+        f_HI = np.asarray(params['f_HI'], dtype=float)
+    else:
+        f_HI = abundance_profile_111n(cfg.n_shells, params['peak_shell'],
+                                       params['multipliers'],
+                                       f_HI_peak=params.get('f_HI_peak', 1.0))
     r_mid = cfg.r_mid
     axes[1, 2].plot(r_mid, f_HI, 'o-', ms=5)
-    axes[1, 2].axvline(r_mid[params['peak_shell'] - 1], ls='--', color='gray', alpha=0.5)
+    if 'peak_shell' in params:
+        axes[1, 2].axvline(r_mid[params['peak_shell'] - 1], ls='--', color='gray', alpha=0.5)
     axes[1, 2].set_xlabel('r (pc)')
     axes[1, 2].set_ylabel('f_HI')
     axes[1, 2].set_title('HI Abundance')
