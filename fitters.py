@@ -11,7 +11,8 @@ def fit_hinspheres(cfg, obs_hinsa_map, T_HI_true_map=None,
                     max_gen=None, popsize=None, seed=None, verbose=False,
                     center_yx=None, pixel_scale_pc=None, R_out_pc=None,
                     mode='forward', obs_hdr=None, distance_pc=None,
-                    fit_velocity_radius_kms=None):
+                    fit_velocity_radius_kms=None,
+                    spatial_res_pc=None, vel_res_kms=None):
     """Fit spherical HINSA model to observed absorption map.
 
     Parameters
@@ -77,7 +78,8 @@ def fit_hinspheres(cfg, obs_hinsa_map, T_HI_true_map=None,
             center_yx=center_yx, pixel_scale_pc=pixel_scale_pc,
             R_out_pc=R_out_pc, mode=mode,
             obs_hdr=obs_hdr, distance_pc=distance_pc,
-            fit_velocity_radius_kms=fit_velocity_radius_kms)
+            fit_velocity_radius_kms=fit_velocity_radius_kms,
+            spatial_res_pc=spatial_res_pc, vel_res_kms=vel_res_kms)
         return best_params, history, param_stds
     else:
         raise ValueError(f"Unknown method: {method}")
@@ -88,7 +90,8 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
                      seed=None, verbose=False,
                      center_yx=None, pixel_scale_pc=None, R_out_pc=None,
                      mode='forward', obs_hdr=None, distance_pc=None,
-                     fit_velocity_radius_kms=None):
+                     fit_velocity_radius_kms=None,
+                     spatial_res_pc=None, vel_res_kms=None):
     """CMA-ES optimizer with ask/tell + joblib parallel evaluation."""
     try:
         import cma
@@ -156,6 +159,18 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
             weight_map_3d[~velo_mask] = 0.0
     else:
         weight_map_3d = None
+
+    # --- Pre-compute smoothing sigmas for the optimization loop ---
+    _sigma_fwhm2sig = 2.0 * np.sqrt(2.0 * np.log(2.0))
+    _sigma_v = 0.0
+    _sigma_xy = 0.0
+    if mode != 'second_derivative':
+        if vel_res_kms is not None and obs_map.ndim == 3:
+            dv = abs(obs_hdr.get('CDELT3', 200.0)) / 1000.0 if obs_hdr else 1.0
+            _sigma_v = (vel_res_kms / dv) / _sigma_fwhm2sig
+        if spatial_res_pc is not None:
+            _sigma_xy = (spatial_res_pc / pixel_scale_pc) / _sigma_fwhm2sig
+    _need_smooth = (_sigma_v > 0) or (_sigma_xy > 0)
 
     param_keys, x0, low, high = _params_to_flat(params_init, bounds, cfg)
 
@@ -233,6 +248,11 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
                                                pixel_scale_pc=pixel_scale_pc,
                                                galactic_b_deg=getattr(cfg, 'galactic_b_deg', None),
                                                R_out_pc=R_out_pc, n_jobs=1)
+                    # Apply beam/velocity smoothing during optimization
+                    if _need_smooth and m.ndim == 3:
+                        from scipy.ndimage import gaussian_filter
+                        m = gaussian_filter(m, sigma=(_sigma_v, _sigma_xy, _sigma_xy),
+                                            mode='reflect')
                     if velo_mask is not None:
                         # Apply velocity mask: set weights to 0 outside range
                         w_3d = np.broadcast_to(weight_map[np.newaxis, :, :], m.shape).copy()
@@ -690,6 +710,8 @@ def fit_hinsa_model(obs_hinsa_fits, obs_background_fits=None,
         obs_hdr=h_obs,
         distance_pc=distance_pc,
         fit_velocity_radius_kms=fit_velocity_radius_kms,
+        spatial_res_pc=spatial_res_pc,
+        vel_res_kms=vel_res_kms,
     )
 
     # --- Build best-fit model cube ---
