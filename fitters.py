@@ -1052,36 +1052,47 @@ def _save_fit_diagnostic_png(png_path, cfg, params, model_cube,
     axes[1, 0].set_title(f'Moment 0 obs ({v_center:.1f}±1 km/s)')
     fig.colorbar(im, ax=axes[1, 0], label='K km/s')
 
-    # 5. Peak absorption: obs vs model — color range from data min/max
-    if mode == 'second_derivative':
-        # In second_derivative mode, show reconstructed T_bg map (vlsr channel)
-        v_center = vlsr_kms + params.get('v_offset', 0.0)
-        v_idx = np.argmin(np.abs(velo_kms - v_center))
-        if model_cube.ndim == 3:
-            tbg_map = model_cube[v_idx, :, :]
-        else:
-            tbg_map = model_cube
-        vmin_tb, vmax_tb = np.nanpercentile(tbg_map, [5, 95])
-        im = axes[1, 1].imshow(tbg_map, origin='lower', cmap='RdYlBu_r',
-                                vmin=vmin_tb, vmax=vmax_tb)
-        axes[1, 1].plot(xc, yc, 'b+', ms=10, mew=1.5)
-        axes[1, 1].set_title(f'Reconstructed T_bg ({v_center:.1f} km/s)')
-        fig.colorbar(im, ax=axes[1, 1], label='K')
-    elif bg_cube is not None:
-        abs_obs = np.max(bg_cube - obs_cube, axis=0)
-        abs_mod = np.max(bg_cube - model_cube, axis=0)
-        abs_max = max(np.nanmax(abs_obs), np.nanmax(abs_mod), 0.01)
-        im = axes[1, 1].imshow(abs_obs, origin='lower', cmap='Reds', vmin=0, vmax=abs_max)
-        axes[1, 1].plot(xc, yc, 'b+', ms=10, mew=1.5)
-        axes[1, 1].set_title('Peak Absorption obs')
-        fig.colorbar(im, ax=axes[1, 1], label='K')
+    # 5. Cold cloud HI column density map (circularly symmetric)
+    n_H = density_plummer(r_mid, params['rho0'], params['r0'], params['alpha'])
+    if 'f_HI' in params:
+        f_HI = np.asarray(params['f_HI'], dtype=float)
     else:
-        abs_obs = np.max(obs_cube, axis=0)
-        abs_max = np.nanmax(abs_obs) if np.any(abs_obs > 0) else 0.01
-        im = axes[1, 1].imshow(abs_obs, origin='lower', cmap='Reds', vmin=0, vmax=abs_max)
-        axes[1, 1].plot(xc, yc, 'b+', ms=10, mew=1.5)
-        axes[1, 1].set_title('Peak Brightness obs')
-        fig.colorbar(im, ax=axes[1, 1], label='K')
+        f_HI = abundance_profile_111n(cfg.n_shells, params.get('peak_shell', 1),
+                                       params.get('multipliers', np.ones(cfg.n_shells-1)),
+                                       f_HI_peak=params.get('f_HI_peak', 1.0))
+    pc_to_cm = 3.086e18
+    dr = cfg.r_outer - cfg.r_inner  # shell thickness in pc
+    nHI_shell = n_H * f_HI * dr * pc_to_cm  # column density per shell (cm^-2)
+
+    # Project onto 2D: NHI(R) = 2 * integral from R to R_out of nHI(r)/sqrt(r^2 - R^2) dr
+    # Use mid-radius of each shell as representative r
+    r_s = r_mid
+    R_grid = np.linspace(0, r_s[-1], 50)  # projected radii
+    NHI_1d = np.zeros_like(R_grid)
+    for iR, R in enumerate(R_grid):
+        if R >= r_s[-1]:
+            NHI_1d[iR] = 0.0
+            continue
+        mask = r_s > R
+        r_use = r_s[mask]
+        n_use = nHI_shell[mask]
+        sqrt_arg = r_use**2 - R**2
+        sqrt_arg[sqrt_arg <= 0] = 1e-30
+        integrand = n_use / np.sqrt(sqrt_arg)
+        NHI_1d[iR] = 2.0 * np.trapz(integrand, r_use)
+
+    # Build 2D map on pixel grid
+    ny, nx = obs_cube.shape[1], obs_cube.shape[2]
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    R_pix = np.sqrt((xx - xc)**2 + (yy - yc)**2) * pixel_scale_pc
+    NHI_map = np.interp(R_pix.ravel(), R_grid, NHI_1d).reshape(ny, nx)
+
+    vmin_nhi, vmax_nhi = 0, np.nanmax(NHI_map) * 1.05 if np.any(NHI_map > 0) else 1.0
+    im = axes[1, 1].imshow(NHI_map, origin='lower', cmap='YlOrRd',
+                            vmin=vmin_nhi, vmax=vmax_nhi)
+    axes[1, 1].plot(xc, yc, 'b+', ms=10, mew=1.5)
+    axes[1, 1].set_title('Cold Cloud N(HI) (cm$^{-2}$)')
+    fig.colorbar(im, ax=axes[1, 1], label='cm$^{-2}$')
 
     # 6. Spectrum at center: obs vs model
     spec_obs = obs_cube[:, yc, xc].astype(float)
