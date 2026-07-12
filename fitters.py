@@ -198,7 +198,7 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
         'verb_disp': int(verbose),
         'verb_log': 0,
         'tolx': 1e-4,
-        'tolfun': 1e-6,
+        'tolfun': 1e-4,
     }
     if seed is not None:
         options['seed'] = seed

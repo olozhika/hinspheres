@@ -13,7 +13,7 @@ class Config:
     R_out_pc: float = 5.        # total cloud radius in pc
 
     # ---- Fitting weight ----
-    weight_index: float = 0.5   # exponent for radial weight: w = 1/r^weight_index
+    weight_index: float = 1.0   # exponent for radial weight: w = 1/r^weight_index
                                 # 0.0 = uniform, 0.5 = 1/sqrt(r), 1.0 = 1/r
 
     # ---- Physical constants (CGS) ----
