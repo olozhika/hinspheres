@@ -385,10 +385,11 @@ def inverse_build_hinsa_cube(cfg, params, obs_cube, center_yx, pixel_scale_pc,
                 v_grid, n_layer, tau0_arr, v_center_arr,
                 sigma_arr, T_s_arr, T_after_fg)
             # Physical guard: clamp reconstructed T_bg to reasonable range.
-            # For HI observations Tb is typically 5-100 K; allow up to 3x
-            # the observed max to avoid unphysical blow-up from noisy channels.
+            # Allow negative values (they indicate model/data mismatch and will
+            # be penalized by the R-value metric via sharp edges in d²T_bg).
+            # Only cap extreme blow-up from division by tiny exp(-tau).
             T_max = float(np.max(T_obs_spec)) * 3.0 + 50.0
-            np.clip(T_bg, 0.0, T_max, out=T_bg)
+            np.clip(T_bg, -T_max, T_max, out=T_bg)
             return T_bg
 
         results = Parallel(n_jobs=n_jobs)(

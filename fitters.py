@@ -164,12 +164,11 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
     _sigma_fwhm2sig = 2.0 * np.sqrt(2.0 * np.log(2.0))
     _sigma_v = 0.0
     _sigma_xy = 0.0
-    if mode != 'second_derivative':
-        if vel_res_kms is not None and obs_map.ndim == 3:
-            dv = abs(obs_hdr.get('CDELT3', 200.0)) / 1000.0 if obs_hdr else 1.0
-            _sigma_v = (vel_res_kms / dv) / _sigma_fwhm2sig
-        if spatial_res_pc is not None:
-            _sigma_xy = (spatial_res_pc / pixel_scale_pc) / _sigma_fwhm2sig
+    if vel_res_kms is not None and obs_map.ndim == 3:
+        dv = abs(obs_hdr.get('CDELT3', 200.0)) / 1000.0 if obs_hdr else 1.0
+        _sigma_v = (vel_res_kms / dv) / _sigma_fwhm2sig
+    if spatial_res_pc is not None:
+        _sigma_xy = (spatial_res_pc / pixel_scale_pc) / _sigma_fwhm2sig
     _need_smooth = (_sigma_v > 0) or (_sigma_xy > 0)
 
     param_keys, x0, phys_lows, phys_highs = _params_to_flat(params_init, bounds, cfg)
@@ -233,6 +232,14 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
                         cfg, params, obs_map, center_yx, pixel_scale_pc,
                         galactic_b_deg=getattr(cfg, 'galactic_b_deg', None),
                         R_out_pc=R_out_pc, n_jobs=1)
+                    # Apply beam/velocity smoothing to reconstructed T_bg
+                    # (obs_map was smoothed during generation; T_bg must match)
+                    if _need_smooth and T_bg_reconstructed.ndim == 3:
+                        from scipy.ndimage import gaussian_filter
+                        T_bg_reconstructed = gaussian_filter(
+                            T_bg_reconstructed,
+                            sigma=(_sigma_v, _sigma_xy, _sigma_xy),
+                            mode='reflect')
                     # Compute R-value: integrated squared 2nd derivative
                     dv = abs(cfg.v_max_kms - cfg.v_min_kms) / (cfg.n_v_channels - 1)
                     d2 = np.zeros_like(T_bg_reconstructed)
@@ -828,6 +835,21 @@ def fit_hinsa_model(obs_hinsa_fits, obs_background_fits=None,
     weight_map_f = 1.0 / r_map_pc_f
 
     if mode == 'second_derivative':
+        # Apply beam/velocity smoothing to reconstructed T_bg
+        # (obs_map was smoothed during generation; T_bg must match)
+        _s_fwhm2sig = 2.0 * np.sqrt(2.0 * np.log(2.0))
+        _s_v = 0.0
+        _s_xy = 0.0
+        if vel_res_kms is not None and model_cube.ndim == 3:
+            _dv = abs(h_obs.get('CDELT3', 200.0)) / 1000.0
+            _s_v = (vel_res_kms / _dv) / _s_fwhm2sig
+        if spatial_res_pc is not None:
+            _s_xy = (spatial_res_pc / pixel_scale_pc) / _s_fwhm2sig
+        if (_s_v > 0 or _s_xy > 0) and model_cube.ndim == 3:
+            from scipy.ndimage import gaussian_filter as _gf
+            model_cube = _gf(model_cube,
+                             sigma=(_s_v, _s_xy, _s_xy),
+                             mode='reflect')
         # Compute R-value for second_derivative mode (reuse T_bg from model_cube)
         dv = abs(cfg.v_max_kms - cfg.v_min_kms) / (cfg.n_v_channels - 1)
         d2 = np.zeros_like(model_cube)
@@ -836,6 +858,17 @@ def fit_hinsa_model(obs_hinsa_fits, obs_background_fits=None,
         # 3D weight map for final residual
         weight_map_3d_f = np.broadcast_to(weight_map_f[np.newaxis, :, :],
                                            model_cube.shape).copy()
+        # Apply velocity mask to final residual (same as optimization loop)
+        if fit_velocity_radius_kms is not None and h_obs is not None:
+            _crval3 = h_obs.get('CRVAL3', 0.0)
+            _cdelt3 = h_obs.get('CDELT3', 0.0)
+            _crpix3 = h_obs.get('CRPIX3', 1.0)
+            _nv = model_cube.shape[0]
+            _v_arr = (_crval3 + _cdelt3 * (np.arange(_nv) - (_crpix3 - 1))) / 1000.0
+            if _v_arr[-1] < _v_arr[0]:
+                _v_arr = _v_arr[::-1]
+            _vmask = np.abs(_v_arr - cfg.vlsr_kms) <= fit_velocity_radius_kms
+            weight_map_3d_f[~_vmask] = 0.0
         r_smooth = np.sum(d2**2 * weight_map_3d_f) * dv / np.sum(weight_map_3d_f)
 
         final_res = r_smooth
