@@ -132,16 +132,18 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
     r_map_pc[r_map_pc == 0] = pixel_scale_pc  # center → same weight as r=1 pixel
     weight_map = 1.0 / r_map_pc ** cfg.weight_index
 
+    # --- Compute velocity axis (always needed for build_synthetic_hinsa) ---
+    crval3 = obs_hdr.get('CRVAL3', 0.0) if obs_hdr is not None else 0.0
+    cdelt3_val = obs_hdr.get('CDELT3', 0.0) if obs_hdr is not None else 200.0
+    crpix3 = obs_hdr.get('CRPIX3', 1.0) if obs_hdr is not None else 1.0
+    n_v_ch = obs_map.shape[0] if obs_map.ndim == 3 else cfg.n_v_channels
+    velo_kms_arr = (crval3 + cdelt3_val * (np.arange(n_v_ch) - (crpix3 - 1))) / 1000.0
+    if velo_kms_arr[-1] < velo_kms_arr[0]:
+        velo_kms_arr = velo_kms_arr[::-1]
+
     # --- Velocity mask: restrict fitting to ±fit_velocity_radius_kms ---
     velo_mask = None
     if fit_velocity_radius_kms is not None and obs_hdr is not None:
-        crval3 = obs_hdr.get('CRVAL3', 0.0)
-        cdelt3_val = obs_hdr.get('CDELT3', 0.0)
-        crpix3 = obs_hdr.get('CRPIX3', 1.0)
-        n_v_ch = obs_map.shape[0] if obs_map.ndim == 3 else cfg.n_v_channels
-        velo_kms_arr = (crval3 + cdelt3_val * (np.arange(n_v_ch) - (crpix3 - 1))) / 1000.0
-        if velo_kms_arr[-1] < velo_kms_arr[0]:
-            velo_kms_arr = velo_kms_arr[::-1]
         v_center = cfg.vlsr_kms
         velo_mask = np.abs(velo_kms_arr - v_center) <= fit_velocity_radius_kms
         if verbose:
@@ -196,7 +198,7 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
         'popsize': popsize,
         'verb_disp': int(verbose),
         'verb_log': 0,
-        'tolx': 1e-4,
+        'tolx': 1e-6,
         'tolfun': 1e-6,
     }
     if seed is not None:
@@ -256,7 +258,8 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
                                                center_yx=center_yx,
                                                pixel_scale_pc=pixel_scale_pc,
                                                galactic_b_deg=getattr(cfg, 'galactic_b_deg', None),
-                                               R_out_pc=R_out_pc, n_jobs=1)
+                                               R_out_pc=R_out_pc, n_jobs=1,
+                                               velo_bg_kms=velo_kms_arr)
                     # Apply beam/velocity smoothing during optimization
                     if _need_smooth and m.ndim == 3:
                         from scipy.ndimage import gaussian_filter
@@ -286,8 +289,16 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
             print(f"  gen {generation:4d} | best={best_fun:.4e} | "
                   f"current={gen_best:.4e} | sigma={es.sigma:.4e}")
 
-    if best_x is None:
+    if best_x is None or not np.all(np.isfinite(best_x)):
         best_x = es.result.xbest
+    if best_x is None or not np.all(np.isfinite(best_x)):
+        # All evaluations failed — return default params with infinite residual
+        params_best = _flat_to_params(x0, param_keys, cfg,
+                                       phys_lows=phys_lows, phys_highs=phys_highs)
+        param_stds = {}
+        for k in param_keys:
+            param_stds[k] = 0.0
+        return params_best, es.result, param_stds
     params_best = _reconstruct(best_x)
 
     # Extract 1-sigma uncertainties from CMA-ES covariance
@@ -347,11 +358,16 @@ def _params_to_flat(params_init, bounds, cfg):
     # --- Scalar parameters ---
     rho0_bounds = bounds.get('rho0', cfg.bounds_pc['rho0'])
     _add('rho0', params_init['rho0'], rho0_bounds[0], rho0_bounds[1])
-    _add('r0', params_init['r0'], bounds['r0'][0], bounds['r0'][1])
-    _add('alpha', params_init['alpha'], bounds['alpha'][0], bounds['alpha'][1])
-    _add('T0', params_init['T0'], bounds['T0'][0], bounds['T0'][1])
-    _add('T1', params_init['T1'], bounds['T1'][0], bounds['T1'][1])
-    _add('rT', params_init['rT'], bounds['rT'][0], bounds['rT'][1])
+    r0_bounds = bounds.get('r0', cfg.bounds_pc['r0'])
+    _add('r0', params_init['r0'], r0_bounds[0], r0_bounds[1])
+    alpha_bounds = bounds.get('alpha', cfg.bounds_pc['alpha'])
+    _add('alpha', params_init['alpha'], alpha_bounds[0], alpha_bounds[1])
+    T0_bounds = bounds.get('T0', cfg.bounds_pc['T0'])
+    _add('T0', params_init['T0'], T0_bounds[0], T0_bounds[1])
+    T1_bounds = bounds.get('T1', cfg.bounds_pc['T1'])
+    _add('T1', params_init['T1'], T1_bounds[0], T1_bounds[1])
+    rT_bounds = bounds.get('rT', cfg.bounds_pc['rT'])
+    _add('rT', params_init['rT'], rT_bounds[0], rT_bounds[1])
 
     # --- Abundance: either f_HI (direct) or peak_shell + multipliers ---
     if 'f_HI' in params_init:
@@ -385,15 +401,21 @@ def _params_to_flat(params_init, bounds, cfg):
 
         for i in range(cfg.n_shells - 1):
             m = params_init['multipliers'][i] if i < len(params_init['multipliers']) else cfg.default_params['multipliers_value']
+            ml_bounds = bounds.get('multipliers', cfg.bounds_pc['multipliers'])
             _add(f'mult_{i}', float(m),
-                 float(bounds['multipliers'][0]), float(bounds['multipliers'][1]))
+                 float(ml_bounds[0]), float(ml_bounds[1]))
 
     # --- Kinematics ---
-    _add('f_ff', params_init['f_ff'], bounds['f_ff'][0], bounds['f_ff'][1])
-    _add('turb_kms', params_init['turb_kms'], bounds['turb_kms'][0], bounds['turb_kms'][1])
-    _add('v_offset', params_init['v_offset'], bounds['v_offset'][0], bounds['v_offset'][1])
-    _add('v_rot_kms', params_init['v_rot_kms'], bounds['v_rot_kms'][0], bounds['v_rot_kms'][1])
-    _add('rot_pa_deg', params_init['rot_pa_deg'], bounds['rot_pa_deg'][0], bounds['rot_pa_deg'][1])
+    f_ff_bounds = bounds.get('f_ff', cfg.bounds_pc['f_ff'])
+    _add('f_ff', params_init['f_ff'], f_ff_bounds[0], f_ff_bounds[1])
+    turb_kms_bounds = bounds.get('turb_kms', cfg.bounds_pc['turb_kms'])
+    _add('turb_kms', params_init['turb_kms'], turb_kms_bounds[0], turb_kms_bounds[1])
+    v_offset_bounds = bounds.get('v_offset', cfg.bounds_pc['v_offset'])
+    _add('v_offset', params_init['v_offset'], v_offset_bounds[0], v_offset_bounds[1])
+    v_rot_kms_bounds = bounds.get('v_rot_kms', cfg.bounds_pc['v_rot_kms'])
+    _add('v_rot_kms', params_init['v_rot_kms'], v_rot_kms_bounds[0], v_rot_kms_bounds[1])
+    rot_pa_deg_bounds = bounds.get('rot_pa_deg', cfg.bounds_pc['rot_pa_deg'])
+    _add('rot_pa_deg', params_init['rot_pa_deg'], rot_pa_deg_bounds[0], rot_pa_deg_bounds[1])
 
     # Normalize to [0,1]
     phys_lows = np.array(phys_lows)
@@ -426,7 +448,6 @@ def _params_to_flat(params_init, bounds, cfg):
                 val = float(np.asarray(params_init['f_HI'], dtype=float)[idx])
             elif key == 'peak_shell':
                 val = float(params_init['peak_shell'])
-                val = float(params_init.get('f_HI_peak', cfg.default_params['f_HI_peak']))
             elif key.startswith('mult_'):
                 idx = int(key.split('_')[-1])
                 val = float(params_init['multipliers'][idx]) if idx < len(params_init['multipliers']) else cfg.default_params['multipliers_value']
@@ -519,7 +540,7 @@ def fit_hinsa_model(obs_hinsa_fits, obs_background_fits=None,
                     max_gen=500, popsize=None,
                     n_jobs=4, seed=None, verbose=True,
                     output_dir=None, mode='forward',
-                    fit_velocity_radius_kms=None):
+                    fit_velocity_radius_kms=3.0):
     """Fit a spherical HINSA model to an observed absorption map using CMA-ES.
 
     One-call wrapper: provide FITS files + geometry, get best fit.
@@ -617,6 +638,11 @@ def fit_hinsa_model(obs_hinsa_fits, obs_background_fits=None,
     # Extract velocity header keywords (always, so they're in scope for npz save)
     crval3 = h_obs.get('CRVAL3', 0.0)
     cdelt3 = h_obs.get('CDELT3', 0.0)
+    # Ascending velocity axis for build_synthetic_hinsa (always ascending v_grid)
+    _crpix3 = h_obs.get('CRPIX3', 1.0)
+    _naxis3 = h_obs.get('NAXIS3', 201)
+    _v_raw = (crval3 + cdelt3 * (np.arange(_naxis3) - (_crpix3 - 1))) / 1000.0
+    velo_kms_asc = _v_raw[::-1] if _v_raw[-1] < _v_raw[0] else _v_raw.copy()
 
     if obs_hinsa_cube.ndim == 3:
         crpix3 = h_obs.get('CRPIX3', 1.0)
@@ -686,62 +712,191 @@ def fit_hinsa_model(obs_hinsa_fits, obs_background_fits=None,
     cfg.galactic_b_deg = galactic_b_deg
 
     # --- Default initial params ---
-    if params_init is None:
-        dp = cfg.default_params
-        params_init = {
-            'rho0': dp['rho0'],
-            'r0': dp['r0'],
-            'alpha': dp['alpha'],
-            'T0': dp['T0'],
-            'T1': dp['T1'],
-            'rT': dp['rT'],
-            'f_HI': np.ones(n_shells) * dp['f_HI_peak'],
-            'f_ff': dp['f_ff'],
-            'turb_kms': dp['turb_kms'],
-            'v_offset': dp['v_offset'],
-            'v_rot_kms': dp['v_rot_kms'],
-            'rot_pa_deg': dp['rot_pa_deg'],
-        }
-
-    # --- Run CMA-ES ---
-    best_params, history, param_stds = fit_hinspheres(
-        cfg, obs_hinsa_cube,
-        T_HI_true_map=obs_background_map,
-        params_init=params_init,
-        bounds=bounds,
-        max_gen=max_gen,
-        popsize=popsize,
-        n_jobs=n_jobs,
-        seed=seed,
-        verbose=verbose,
-        center_yx=center_yx,
-        pixel_scale_pc=pixel_scale_pc,
-        R_out_pc=R_out_pc,
-        mode=mode,
-        obs_hdr=h_obs,
-        distance_pc=distance_pc,
-        fit_velocity_radius_kms=fit_velocity_radius_kms,
-        spatial_res_pc=spatial_res_pc,
-        vel_res_kms=vel_res_kms,
-    )
-
-    # --- Build best-fit model cube ---
-    if mode == 'second_derivative':
-        # Reconstruct T_bg from best-fit model (inverse RT)
-        from .models import inverse_build_hinsa_cube
-        T_bg_reconstructed = inverse_build_hinsa_cube(
-            cfg, best_params, obs_hinsa_cube, center_yx, pixel_scale_pc,
-            galactic_b_deg=galactic_b_deg,
-            R_out_pc=R_out_pc, n_jobs=n_jobs)
-        model_cube = T_bg_reconstructed
+    dp = cfg.default_params
+    # Determine abundance mode from user input
+    _use_peak_shell_mode = (params_init is not None and
+                            ('peak_shell' in params_init or 'multipliers' in params_init))
+    default_params_init = {
+        'rho0': dp['rho0'],
+        'r0': dp['r0'],
+        'alpha': dp['alpha'],
+        'T0': dp['T0'],
+        'T1': dp['T1'],
+        'rT': dp['rT'],
+        'f_ff': dp['f_ff'],
+        'turb_kms': dp['turb_kms'],
+        'v_offset': dp['v_offset'],
+        'v_rot_kms': dp['v_rot_kms'],
+        'rot_pa_deg': dp['rot_pa_deg'],
+    }
+    if _use_peak_shell_mode:
+        default_params_init['peak_shell'] = dp['peak_shell']
+        default_params_init['f_HI_peak'] = dp['f_HI_peak']
+        default_params_init['multipliers'] = np.ones(n_shells - 1) * dp['multipliers_value']
     else:
-        model_cube = build_synthetic_hinsa(cfg, best_params,
-                                           bg_cube=obs_background_map,
-                                           center_yx=center_yx,
-                                           pixel_scale_pc=pixel_scale_pc,
-                                           galactic_b_deg=galactic_b_deg,
-                                           R_out_pc=R_out_pc,
-                                           n_jobs=n_jobs)
+        default_params_init['f_HI'] = np.ones(n_shells) * dp['f_HI_peak']
+
+    if params_init is None:
+        params_init = default_params_init
+    else:
+        # Merge user params with defaults (user overrides defaults)
+        for k, v in default_params_init.items():
+            if k not in params_init:
+                params_init[k] = v
+
+    # --- Build model cube from params (for residual computation) ---
+    def _build_model(best_p):
+        if mode == 'second_derivative':
+            from .models import inverse_build_hinsa_cube
+            return inverse_build_hinsa_cube(
+                cfg, best_p, obs_hinsa_cube, center_yx, pixel_scale_pc,
+                galactic_b_deg=galactic_b_deg,
+                R_out_pc=R_out_pc, n_jobs=n_jobs)
+        else:
+            return build_synthetic_hinsa(cfg, best_p,
+                                        bg_cube=obs_background_map,
+                                        center_yx=center_yx,
+                                        pixel_scale_pc=pixel_scale_pc,
+                                        galactic_b_deg=galactic_b_deg,
+                                        R_out_pc=R_out_pc,
+                                        n_jobs=n_jobs,
+                                        velo_bg_kms=velo_kms_asc)
+
+    # --- Compute final residual from model cube ---
+    def _compute_residual(mc):
+        ny_f, nx_f = obs_hinsa_cube.shape[1], obs_hinsa_cube.shape[2]
+        yy_f, xx_f = np.mgrid[0:ny_f, 0:nx_f]
+        if mode == 'second_derivative':
+            _s_fwhm2sig = 2.0 * np.sqrt(2.0 * np.log(2.0))
+            _s_v = 0.0
+            _s_xy = 0.0
+            if vel_res_kms is not None and mc.ndim == 3:
+                _dv = abs(h_obs.get('CDELT3', 200.0)) / 1000.0
+                _s_v = (vel_res_kms / _dv) / _s_fwhm2sig
+            if spatial_res_pc is not None:
+                _s_xy = (spatial_res_pc / pixel_scale_pc) / _s_fwhm2sig
+            if (_s_v > 0 or _s_xy > 0) and mc.ndim == 3:
+                from scipy.ndimage import gaussian_filter as _gf
+                mc = _gf(mc, sigma=(_s_v, _s_xy, _s_xy), mode='reflect')
+            dv = abs(cfg.v_max_kms - cfg.v_min_kms) / (cfg.n_v_channels - 1)
+            d2 = np.zeros_like(mc)
+            d2[1:-1] = (mc[2:] + mc[:-2] - 2.0 * mc[1:-1]) / (dv**2)
+            r_map_f = np.sqrt(((yy_f - center_yx[0]).astype(float))**2 +
+                              ((xx_f - center_yx[1]).astype(float))**2)
+            r_map_pc_f = r_map_f * pixel_scale_pc
+            r_map_pc_f[r_map_pc_f == 0] = pixel_scale_pc
+            wm3 = (1.0 / r_map_pc_f)[np.newaxis, :, :]
+            wm3 = np.broadcast_to(wm3, mc.shape).copy()
+            if fit_velocity_radius_kms is not None and h_obs is not None:
+                _crval3 = h_obs.get('CRVAL3', 0.0)
+                _cdelt3 = h_obs.get('CDELT3', 0.0)
+                _crpix3 = h_obs.get('CRPIX3', 1.0)
+                _nv = mc.shape[0]
+                _v_arr = (_crval3 + _cdelt3 * (np.arange(_nv) - (_crpix3 - 1))) / 1000.0
+                if _v_arr[-1] < _v_arr[0]:
+                    _v_arr = _v_arr[::-1]
+                _vmask = np.abs(_v_arr - cfg.vlsr_kms) <= fit_velocity_radius_kms
+                wm3[~_vmask] = 0.0
+            return np.sum(d2**2 * wm3) * dv / np.sum(wm3)
+        else:
+            r_map_f = np.sqrt(((yy_f - center_yx[0]).astype(float))**2 +
+                              ((xx_f - center_yx[1]).astype(float))**2)
+            r_map_pc_f = r_map_f * pixel_scale_pc
+            r_map_pc_f[r_map_pc_f == 0] = pixel_scale_pc
+            weight_map_f = 1.0 / r_map_pc_f
+            # Apply velocity mask to 3D cubes for forward mode
+            mc_use = mc
+            obs_use = obs_hinsa_cube
+            if fit_velocity_radius_kms is not None and h_obs is not None:
+                _crval3 = h_obs.get('CRVAL3', 0.0)
+                _cdelt3 = h_obs.get('CDELT3', 0.0)
+                _crpix3 = h_obs.get('CRPIX3', 1.0)
+                _nv = mc.shape[0]
+                _v_arr = (_crval3 + _cdelt3 * (np.arange(_nv) - (_crpix3 - 1))) / 1000.0
+                if _v_arr[-1] < _v_arr[0]:
+                    _v_arr = _v_arr[::-1]
+                _vmask = np.abs(_v_arr - cfg.vlsr_kms) > fit_velocity_radius_kms
+                mc_use = mc.copy(); mc_use[_vmask] = np.nan
+                obs_use = obs_hinsa_cube.copy(); obs_use[_vmask] = np.nan
+            return residual_map(obs_use, mc_use, weights=weight_map_f)
+
+    # --- Determine if peak_shell scanning is needed ---
+    model_cube = None
+    final_res = None
+    history = None
+    all_runs = None
+    _ps_bounds = bounds.get('peak_shell', (1, n_shells))
+    _ps_lo, _ps_hi = int(_ps_bounds[0]), int(_ps_bounds[1])
+    _peak_shell_scan = (_ps_lo != _ps_hi) and ('peak_shell' in params_init)
+
+    if _peak_shell_scan:
+        # --- Multi-run peak_shell scanning ---
+        if verbose:
+            print(f'\n=== peak_shell scanning: testing integer values {_ps_lo}..{_ps_hi} ===')
+        all_runs = []
+        for _ps_val in range(_ps_lo, _ps_hi + 1):
+            if verbose:
+                print(f'\n--- peak_shell = {_ps_val}/{_ps_hi} ---')
+            bounds_ps = dict(bounds)
+            bounds_ps['peak_shell'] = (float(_ps_val), float(_ps_val))
+            params_init_ps = dict(params_init)
+            params_init_ps['peak_shell'] = _ps_val
+            bp, hist, pst = fit_hinspheres(
+                cfg, obs_hinsa_cube,
+                T_HI_true_map=obs_background_map,
+                params_init=params_init_ps,
+                bounds=bounds_ps,
+                max_gen=max_gen, popsize=popsize,
+                n_jobs=n_jobs, seed=seed, verbose=verbose,
+                center_yx=center_yx, pixel_scale_pc=pixel_scale_pc,
+                R_out_pc=R_out_pc, mode=mode, obs_hdr=h_obs,
+                distance_pc=distance_pc,
+                fit_velocity_radius_kms=fit_velocity_radius_kms,
+                spatial_res_pc=spatial_res_pc, vel_res_kms=vel_res_kms)
+            mc = _build_model(bp)
+            res = _compute_residual(mc)
+            all_runs.append({'peak_shell': _ps_val, 'params': bp,
+                             'param_stds': pst, 'residual': res,
+                             'model_cube': mc, 'history': hist})
+            if verbose:
+                print(f'  peak_shell={_ps_val}  residual={res:.4e}')
+        all_runs.sort(key=lambda r: r['residual'])
+        best_run = all_runs[0]
+        best_params = best_run['params']
+        param_stds = best_run['param_stds']
+        final_res = best_run['residual']
+        model_cube = best_run['model_cube']
+        history = best_run['history']
+        if verbose:
+            print(f'\n=== Best peak_shell = {best_run["peak_shell"]} (residual={final_res:.4e}) ===')
+            print(f'=== Top {min(3, len(all_runs))} results ===')
+            for i, r in enumerate(all_runs[:3]):
+                print(f'  #{i+1}: peak_shell={r["peak_shell"]}  residual={r["residual"]:.4e}')
+    else:
+        # --- Single-run CMA-ES (existing behavior) ---
+        best_params, history, param_stds = fit_hinspheres(
+            cfg, obs_hinsa_cube,
+            T_HI_true_map=obs_background_map,
+            params_init=params_init,
+            bounds=bounds,
+            max_gen=max_gen,
+            popsize=popsize,
+            n_jobs=n_jobs,
+            seed=seed,
+            verbose=verbose,
+            center_yx=center_yx,
+            pixel_scale_pc=pixel_scale_pc,
+            R_out_pc=R_out_pc,
+            mode=mode,
+            obs_hdr=h_obs,
+            distance_pc=distance_pc,
+            fit_velocity_radius_kms=fit_velocity_radius_kms,
+            spatial_res_pc=spatial_res_pc,
+            vel_res_kms=vel_res_kms)
+
+    # --- Build best-fit model cube (if not already built by scanning) ---
+    if model_cube is None:
+        model_cube = _build_model(best_params)
 
     # --- Compute relative errors for simulated clouds ---
     relative_errors = None
@@ -825,60 +980,83 @@ def fit_hinsa_model(obs_hinsa_fits, obs_background_fits=None,
                 parts.append(f'velocity={vel_res_kms:.3f} km/s ({sigma_v * sigma_fwhm2sig:.1f} ch)')
             print(f'Smoothing: {", ".join(parts)}')
 
-    # --- Radial weight map for final residual ---
-    ny_f, nx_f = obs_hinsa_cube.shape[1], obs_hinsa_cube.shape[2]
-    yy_f, xx_f = np.mgrid[0:ny_f, 0:nx_f]
-    r_map_f = np.sqrt(((yy_f - center_yx[0]).astype(float))**2 +
-                       ((xx_f - center_yx[1]).astype(float))**2)
-    r_map_pc_f = r_map_f * pixel_scale_pc
-    r_map_pc_f[r_map_pc_f == 0] = pixel_scale_pc
-    weight_map_f = 1.0 / r_map_pc_f
+    # --- Compute final residual (skip if already computed by peak_shell scan) ---
+    if final_res is None:
+        ny_f, nx_f = obs_hinsa_cube.shape[1], obs_hinsa_cube.shape[2]
+        yy_f, xx_f = np.mgrid[0:ny_f, 0:nx_f]
+        r_map_f = np.sqrt(((yy_f - center_yx[0]).astype(float))**2 +
+                           ((xx_f - center_yx[1]).astype(float))**2)
+        r_map_pc_f = r_map_f * pixel_scale_pc
+        r_map_pc_f[r_map_pc_f == 0] = pixel_scale_pc
+        weight_map_f = 1.0 / r_map_pc_f
 
-    if mode == 'second_derivative':
-        # Apply beam/velocity smoothing to reconstructed T_bg
-        # (obs_map was smoothed during generation; T_bg must match)
-        _s_fwhm2sig = 2.0 * np.sqrt(2.0 * np.log(2.0))
-        _s_v = 0.0
-        _s_xy = 0.0
-        if vel_res_kms is not None and model_cube.ndim == 3:
-            _dv = abs(h_obs.get('CDELT3', 200.0)) / 1000.0
-            _s_v = (vel_res_kms / _dv) / _s_fwhm2sig
-        if spatial_res_pc is not None:
-            _s_xy = (spatial_res_pc / pixel_scale_pc) / _s_fwhm2sig
-        if (_s_v > 0 or _s_xy > 0) and model_cube.ndim == 3:
-            from scipy.ndimage import gaussian_filter as _gf
-            model_cube = _gf(model_cube,
-                             sigma=(_s_v, _s_xy, _s_xy),
-                             mode='reflect')
-        # Compute R-value for second_derivative mode (reuse T_bg from model_cube)
-        dv = abs(cfg.v_max_kms - cfg.v_min_kms) / (cfg.n_v_channels - 1)
-        d2 = np.zeros_like(model_cube)
-        d2[1:-1] = (model_cube[2:] + model_cube[:-2]
-                    - 2.0 * model_cube[1:-1]) / (dv**2)
-        # 3D weight map for final residual
-        weight_map_3d_f = np.broadcast_to(weight_map_f[np.newaxis, :, :],
-                                           model_cube.shape).copy()
-        # Apply velocity mask to final residual (same as optimization loop)
-        if fit_velocity_radius_kms is not None and h_obs is not None:
-            _crval3 = h_obs.get('CRVAL3', 0.0)
-            _cdelt3 = h_obs.get('CDELT3', 0.0)
-            _crpix3 = h_obs.get('CRPIX3', 1.0)
-            _nv = model_cube.shape[0]
-            _v_arr = (_crval3 + _cdelt3 * (np.arange(_nv) - (_crpix3 - 1))) / 1000.0
-            if _v_arr[-1] < _v_arr[0]:
-                _v_arr = _v_arr[::-1]
-            _vmask = np.abs(_v_arr - cfg.vlsr_kms) <= fit_velocity_radius_kms
-            weight_map_3d_f[~_vmask] = 0.0
-        r_smooth = np.sum(d2**2 * weight_map_3d_f) * dv / np.sum(weight_map_3d_f)
+        if mode == 'second_derivative':
+            _s_fwhm2sig = 2.0 * np.sqrt(2.0 * np.log(2.0))
+            _s_v = 0.0
+            _s_xy = 0.0
+            if vel_res_kms is not None and model_cube.ndim == 3:
+                _dv = abs(h_obs.get('CDELT3', 200.0)) / 1000.0
+                _s_v = (vel_res_kms / _dv) / _s_fwhm2sig
+            if spatial_res_pc is not None:
+                _s_xy = (spatial_res_pc / pixel_scale_pc) / _s_fwhm2sig
+            if (_s_v > 0 or _s_xy > 0) and model_cube.ndim == 3:
+                from scipy.ndimage import gaussian_filter as _gf
+                model_cube = _gf(model_cube,
+                                 sigma=(_s_v, _s_xy, _s_xy),
+                                 mode='reflect')
+            dv = abs(cfg.v_max_kms - cfg.v_min_kms) / (cfg.n_v_channels - 1)
+            d2 = np.zeros_like(model_cube)
+            d2[1:-1] = (model_cube[2:] + model_cube[:-2]
+                        - 2.0 * model_cube[1:-1]) / (dv**2)
+            weight_map_3d_f = np.broadcast_to(weight_map_f[np.newaxis, :, :],
+                                               model_cube.shape).copy()
+            if fit_velocity_radius_kms is not None and h_obs is not None:
+                _crval3 = h_obs.get('CRVAL3', 0.0)
+                _cdelt3 = h_obs.get('CDELT3', 0.0)
+                _crpix3 = h_obs.get('CRPIX3', 1.0)
+                _nv = model_cube.shape[0]
+                _v_arr = (_crval3 + _cdelt3 * (np.arange(_nv) - (_crpix3 - 1))) / 1000.0
+                if _v_arr[-1] < _v_arr[0]:
+                    _v_arr = _v_arr[::-1]
+                _vmask = np.abs(_v_arr - cfg.vlsr_kms) <= fit_velocity_radius_kms
+                weight_map_3d_f[~_vmask] = 0.0
+            final_res = np.sum(d2**2 * weight_map_3d_f) * dv / np.sum(weight_map_3d_f)
+        else:
+            # Forward mode: apply velocity mask via NaN before residual_map
+            mc_use = model_cube
+            obs_use = obs_hinsa_cube
+            if fit_velocity_radius_kms is not None and h_obs is not None:
+                _crval3 = h_obs.get('CRVAL3', 0.0)
+                _cdelt3 = h_obs.get('CDELT3', 0.0)
+                _crpix3 = h_obs.get('CRPIX3', 1.0)
+                _nv = model_cube.shape[0]
+                _v_arr = (_crval3 + _cdelt3 * (np.arange(_nv) - (_crpix3 - 1))) / 1000.0
+                if _v_arr[-1] < _v_arr[0]:
+                    _v_arr = _v_arr[::-1]
+                _vmask = np.abs(_v_arr - cfg.vlsr_kms) > fit_velocity_radius_kms
+                mc_use = model_cube.copy(); mc_use[_vmask] = np.nan
+                obs_use = obs_hinsa_cube.copy(); obs_use[_vmask] = np.nan
+            final_res = residual_map(obs_use, mc_use, weights=weight_map_f)
 
-        final_res = r_smooth
-    else:
-        final_res = residual_map(obs_hinsa_cube, model_cube, weights=weight_map_f)
+    # --- Print results (always show peak_shell scan results) ---
+    if _peak_shell_scan and all_runs is not None:
+        print(f'\n=== peak_shell scan results (sorted by residual) ===')
+        for i, r in enumerate(all_runs):
+            ps = r['peak_shell']
+            res = r['residual']
+            marker = ' <-- best' if i == 0 else ''
+            print(f'  #{i+1}: peak_shell={ps}  residual={res:.4e}{marker}')
 
     if verbose:
         print(f'\nFinal residual: {final_res:.4e}')
+        if 'peak_shell' in best_params:
+            print(f'  peak_shell  = {best_params["peak_shell"]}')
+        if 'f_HI_peak' in best_params:
+            print(f'  f_HI_peak   = {best_params["f_HI_peak"]:.4f}')
         print('Best-fit params (±1σ):')
         for k, v in best_params.items():
+            if k in ('peak_shell', 'f_HI_peak'):
+                continue
             std = param_stds.get(k, 0.0)
             if isinstance(v, np.ndarray):
                 std_arr = param_stds.get(k, 0.0)
@@ -988,6 +1166,11 @@ def fit_hinsa_model(obs_hinsa_fits, obs_background_fits=None,
         'obs_background_fits': obs_background_fits if obs_background_fits else '',
         'mode': mode,
     }
+    if all_runs is not None:
+        scan_peaks = np.array([r['peak_shell'] for r in all_runs])
+        scan_residuals = np.array([r['residual'] for r in all_runs])
+        npz_save_dict['peak_shell_scan_peaks'] = scan_peaks
+        npz_save_dict['peak_shell_scan_residuals'] = scan_residuals
     if relative_errors is not None:
         for pk, re_val in relative_errors.items():
             npz_save_dict[f'relative_error_{pk}'] = re_val
@@ -1010,6 +1193,7 @@ def fit_hinsa_model(obs_hinsa_fits, obs_background_fits=None,
         'png_path': png_path,
         'grid_png_path': grid_png_path,
         'npz_path': npz_path,
+        'all_runs': all_runs,
     }
 
 

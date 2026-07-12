@@ -102,7 +102,8 @@ def compute_foreground_params(cfg, galactic_b_deg=None):
 
 def build_synthetic_hinsa(cfg, params, bg_cube, center_yx, pixel_scale_pc,
                           galactic_b_deg=None,
-                          R_out_pc=None, vlsr_kms=None, n_jobs=1):
+                          R_out_pc=None, vlsr_kms=None, n_jobs=1,
+                          velo_bg_kms=None):
     """Forward-model a synthetic HI cube with HINSA absorption.
 
     The output grid always matches the input bg_cube.
@@ -185,6 +186,10 @@ def build_synthetic_hinsa(cfg, params, bg_cube, center_yx, pixel_scale_pc,
             if bg_cube.ndim == 3:
                 bg_is_3d = True
                 T_bg_3d = bg_cube.astype(np.float64)
+                # Ensure bg_cube velocity axis matches ascending v_grid
+                if velo_bg_kms is not None and len(velo_bg_kms) == bg_cube.shape[0]:
+                    if velo_bg_kms[-1] < velo_bg_kms[0]:
+                        T_bg_3d = T_bg_3d[::-1, :, :].copy()
             else:
                 T_bg_2d = bg_cube.astype(np.float64)
         else:
@@ -543,8 +548,7 @@ def residual_map(obs_map, model_map, weights=None):
     if not np.any(mask):
         return 1e10
     diff = obs_map[mask] - model_map[mask]
-    denom = np.maximum(np.abs(obs_map[mask]), 0.01)
-    val = diff**2 / denom
+    val = diff**2
 
     if weights is not None:
         if model_map.ndim == 3 and weights.ndim == 2:
@@ -783,7 +787,8 @@ def generate_sim_hinsa(output_path, background=None, center_pixel=None,
 
     out_cube = build_synthetic_hinsa(
         cfg, params, bg_cube, (yc, xc), pixel_scale_pc,
-        galactic_b_deg=galactic_b_deg, n_jobs=n_jobs
+        galactic_b_deg=galactic_b_deg, n_jobs=n_jobs,
+        velo_bg_kms=velo_kms
     )
 
     # --- Compute optical depth range at center pixel ---
@@ -841,6 +846,15 @@ def generate_sim_hinsa(output_path, background=None, center_pixel=None,
         absorption = bg_spec - out_cube[:, yc, xc]
         peak_idx = np.argmax(absorption)
         print(f"Center: peak_abs={absorption.max():.2f} K at v={velo_kms[peak_idx]:.2f} km/s")
+
+    # --- Flip output cube to descending velocity order to match FITS header ---
+    # v_grid inside build_synthetic_hinsa is always ascending, but the FITS
+    # header uses the original bg FITS velocity axis (CDELT3 < 0 = descending).
+    # We must flip the data so it matches the header convention.
+    if n_v > 1 and velo_kms[1] < velo_kms[0]:
+        out_cube = out_cube[::-1, :, :].copy()
+        if verbose:
+            print(f"Flipped output to descending velocity (to match FITS header)")
 
     # --- Build FITS header ---
     out_hdr = pyfits.Header()
