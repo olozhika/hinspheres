@@ -197,34 +197,28 @@ def radiative_transfer_pixel(
     T_B : 1D array — brightness temperature at each velocity channel
     """
     n_v = len(v_grid_kms)
-    T_B = np.zeros(n_v)
 
     # Broadcast scalar background to array
     if np.ndim(T_bg_kms) == 0:
-        T_bg_arr = np.full(n_v, float(T_bg_kms))
+        T = np.full(n_v, float(T_bg_kms))
     else:
-        T_bg_arr = np.asarray(T_bg_kms, dtype=float)
+        T = np.asarray(T_bg_kms, dtype=float).copy()
 
-    for iv in range(n_v):
-        v = v_grid_kms[iv]
+    # Vectorized: loop over layers, operate on full velocity array
+    for k in range(n_layers):
+        tau_v = layer_tau0[k] * np.exp(
+            -0.5 * ((v_grid_kms - layer_v_center_kms[k]) / layer_sigma_kms[k])**2)
+        exp_neg_tau = np.exp(-tau_v)
+        T = T * exp_neg_tau + \
+                layer_T_spin[k] * (1.0 - exp_neg_tau)
 
-        T_obs = T_bg_arr[iv]
+    # Foreground HI (only if not handled externally)
+    if tau_fg is not None and T_HI_galactic is not None:
+        exp_neg_tau_fg = np.exp(-tau_fg)
+        T = T * exp_neg_tau_fg + \
+                float(T_HI_galactic) * (1.0 - exp_neg_tau_fg)
 
-        # Propagate through each cold cloud layer
-        for k in range(n_layers):
-            tau_v = layer_tau0[k] * np.exp(
-                -0.5 * ((v - layer_v_center_kms[k]) / layer_sigma_kms[k])**2)
-            T_obs = T_obs * np.exp(-tau_v) + \
-                    layer_T_spin[k] * (1.0 - np.exp(-tau_v))
-
-        # Foreground HI (only if not handled externally)
-        if tau_fg is not None and T_HI_galactic is not None:
-            T_obs = T_obs * np.exp(-tau_fg) + \
-                    float(T_HI_galactic) * (1.0 - np.exp(-tau_fg))
-
-        T_B[iv] = T_obs
-
-    return T_B
+    return T
 
 
 def compute_layer_tau0(cfg, n_HI, T_spin, dl_pc, sigma_kms):
