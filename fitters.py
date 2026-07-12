@@ -1113,10 +1113,10 @@ def _save_fit_diagnostic_png(png_path, cfg, params, model_cube,
         axes[1, 2].plot(velo_kms, spec_bg, 'gray', alpha=0.4, label='Background')
         axes[1, 2].plot(velo_kms, spec_obs, 'k', lw=1.5, label='Obs')
         axes[1, 2].plot(velo_kms, spec_mod, 'r--', lw=1.5, label='Best-fit model')
-    axes[1, 2].axvline(v_center, color='blue', ls=':', alpha=0.5)
+    axes[1, 2].axvline(vlsr_kms, color='blue', ls=':', alpha=0.5)
     if fit_velocity_radius_kms is not None:
-        v_lo = v_center - fit_velocity_radius_kms
-        v_hi = v_center + fit_velocity_radius_kms
+        v_lo = vlsr_kms - fit_velocity_radius_kms
+        v_hi = vlsr_kms + fit_velocity_radius_kms
         axes[1, 2].axvspan(v_lo, v_hi, alpha=0.15, color='blue',
                            label=f'Fit range (±{fit_velocity_radius_kms:.1f})')
     axes[1, 2].set_xlabel('v (km/s)')
