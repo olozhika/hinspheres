@@ -142,7 +142,7 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
         velo_kms_arr = (crval3 + cdelt3_val * (np.arange(n_v_ch) - (crpix3 - 1))) / 1000.0
         if velo_kms_arr[-1] < velo_kms_arr[0]:
             velo_kms_arr = velo_kms_arr[::-1]
-        v_center = cfg.vlsr_kms + params_init.get('v_offset', 0.0)
+        v_center = cfg.vlsr_kms
         velo_mask = np.abs(velo_kms_arr - v_center) <= fit_velocity_radius_kms
         if verbose:
             v_lo = float(velo_kms_arr[velo_mask].min()) if np.any(velo_mask) else v_center
@@ -198,7 +198,7 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
         'verb_disp': int(verbose),
         'verb_log': 0,
         'tolx': 1e-4,
-        'tolfun': 1e-4,
+        'tolfun': 1e-6,
     }
     if seed is not None:
         options['seed'] = seed
