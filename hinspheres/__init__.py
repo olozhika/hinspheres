@@ -1,0 +1,38 @@
+"""
+hinspheres - Spherically symmetric, multi-layer HINSA radiative transfer modeling.
+Forward-fits radial profiles (density, temperature, HI abundance, infall velocity)
+to observed HINSA absorption maps.
+
+Reference models:
+  - Li & Goldsmith (2003)  : three-component HI 21cm RT
+  - Goldsmith, Li & Krco    (2007) : HI->H2 time evolution in slab clouds
+  - Zuo+2018                : onion-like HI shells in dark clouds
+  - Plummer density profile : n(r) = n0 / (1 + (r/r0)^alpha)
+"""
+
+from .config import Config
+from .profiles import density_plummer, temperature_plummer, \
+    abundance_profile_111n, infall_velocity
+from .rt import make_shells, los_path_lengths, radiative_transfer_pixel, \
+    inverse_radiative_transfer_pixel
+from .rt_1d import four_layer_absorption_spectrum, four_layer_forward_rt, \
+    compute_tau0, compute_sigma_v
+from .models import build_synthetic_hinsa, inverse_build_hinsa_cube, \
+    generate_sim_hinsa, residual_map
+from .fitters import fit_hinspheres, fit_hinsa_model, reload_fit_result
+from .mcmc import run_mcmc, save_corner_plot, save_chain_plot
+
+__all__ = [
+    'Config',
+    'density_plummer', 'temperature_plummer',
+    'abundance_profile_111n', 'infall_velocity',
+    'make_shells', 'los_path_lengths', 'radiative_transfer_pixel',
+    'inverse_radiative_transfer_pixel',
+    'four_layer_absorption_spectrum', 'four_layer_forward_rt',
+    'compute_tau0', 'compute_sigma_v',
+    'build_synthetic_hinsa', 'inverse_build_hinsa_cube',
+    'generate_sim_hinsa',
+    'residual_map', 'fit_hinsa_model', 'fit_hinspheres',
+    'reload_fit_result',
+    'run_mcmc', 'save_corner_plot', 'save_chain_plot',
+]
