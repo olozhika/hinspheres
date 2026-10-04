@@ -9,8 +9,114 @@ Radiative transfer follows the Li & Goldsmith (2003) three-component
 formalism along each LOS, with the cold cloud divided into N shells.
 """
 
+import math
 import numpy as np
+from numba import njit
 
+
+# ---- Numba-JITted hot-path functions (used by models.py pixel loop) ----
+
+@njit(cache=True)
+def _njit_los_path_lengths(b, r_outer, n_shells):
+    max_layers = 2 * n_shells
+    out_k = np.zeros(max_layers, dtype=np.int64)
+    out_dl = np.zeros(max_layers)
+    out_z = np.zeros(max_layers)
+    n = 0
+
+    i_center = 0
+    while i_center < n_shells and b >= r_outer[i_center]:
+        i_center += 1
+    if i_center >= n_shells:
+        return out_k, out_dl, out_z, 0
+
+    for k in range(n_shells - 1, i_center - 1, -1):
+        r_in = r_outer[k - 1] if k > i_center else b
+        r_out = r_outer[k]
+        dl = math.sqrt(max(0.0, r_out**2 - b**2))
+        if k > i_center:
+            dl -= math.sqrt(max(0.0, r_outer[k - 1]**2 - b**2))
+        if dl > 1e-10:
+            z_mid = -0.5 * (math.sqrt(max(0.0, r_out**2 - b**2)) +
+                            (math.sqrt(max(0.0, r_in**2 - b**2)) if k > i_center else 0.0))
+            out_k[n], out_dl[n], out_z[n] = k, dl, z_mid
+            n += 1
+
+    for k in range(i_center, n_shells):
+        r_in = r_outer[k - 1] if k > i_center else b
+        r_out = r_outer[k]
+        dl = math.sqrt(max(0.0, r_out**2 - b**2))
+        if k > i_center:
+            dl -= math.sqrt(max(0.0, r_outer[k - 1]**2 - b**2))
+        if dl > 1e-10:
+            z_mid = (math.sqrt(max(0.0, r_out**2 - b**2)) +
+                     (math.sqrt(max(0.0, r_in**2 - b**2)) if k > i_center else 0.0)) / 2.0
+            out_k[n], out_dl[n], out_z[n] = k, dl, z_mid
+            n += 1
+
+    return out_k, out_dl, out_z, n
+
+
+@njit(cache=True)
+def _njit_compute_layer_tau0(c_light, A_10, nu_21cm, pc_cm,
+                              h_planck, k_B,
+                              n_HI, T_spin, dl_pc, sigma_kms):
+    const = 3.0 * h_planck * c_light**3 * A_10 / \
+            (32.0 * math.pi * k_B * nu_21cm**2)
+    sigma_cms = sigma_kms * 1e5
+    if sigma_cms < 1.0:
+        return 0.0
+    T_spin_safe = T_spin if T_spin > 1.0 else 1.0
+    return const * n_HI * (dl_pc * pc_cm) / (T_spin_safe * sigma_cms * math.sqrt(2.0 * math.pi))
+
+
+@njit(cache=True)
+def _njit_los_velocity(b, z, r_mid, v_infall_kms,
+                        v_rot_kms, rot_pa_deg, dx, dy, r_cloud):
+    r = math.sqrt(b * b + z * z)
+    if r < 1e-10:
+        return 0.0
+    cos_theta = z / r
+    idx = np.searchsorted(r_mid, r)
+    idx = min(idx, len(v_infall_kms) - 1)
+    v_inf = v_infall_kms[idx]
+    v_los_inf = v_inf * (1.0 if z >= 0 else -1.0) * abs(cos_theta)
+
+    v_los_rot = 0.0
+    if v_rot_kms != 0.0 and (dx != 0.0 or dy != 0.0):
+        pa_rad = rot_pa_deg * math.pi / 180.0
+        if r_cloud > 0.0:
+            omega = v_rot_kms / r_cloud
+            v_los_rot = omega * (-math.sin(pa_rad) * dy - math.cos(pa_rad) * dx)
+
+    return v_los_inf + v_los_rot
+
+
+@njit(cache=True)
+def _njit_rt_pixel(v_grid, n_layers, tau0, v_center, sigma, T_s, T_bg):
+    T = np.copy(T_bg)
+    for k in range(n_layers):
+        dv = v_grid - v_center[k]
+        tau_v = tau0[k] * np.exp(-0.5 * (dv / sigma[k])**2)
+        e_tau = np.exp(-tau_v)
+        T = T * e_tau + T_s[k] * (1.0 - e_tau)
+    return T
+
+
+@njit(cache=True)
+def _njit_inverse_rt_pixel(v_grid, n_layers, tau0, v_center, sigma, T_s, T_obs):
+    T = np.copy(T_obs)
+    eps_min = 0.01
+    for k in range(n_layers - 1, -1, -1):
+        dv = v_grid - v_center[k]
+        tau_v = tau0[k] * np.exp(-0.5 * (dv / sigma[k])**2)
+        e_tau = np.exp(-tau_v)
+        e_tau = np.maximum(e_tau, eps_min)
+        T = (T - T_s[k] * (1.0 - e_tau)) / e_tau
+    return T
+
+
+# ---- Original public functions (kept for backward compat) ----
 
 def make_shells(r_mid, r_outer, n_H, T_spin, v_infall, sigma_v, pc_cm):
     """Assemble shell arrays for the ray-tracer.
@@ -225,16 +331,18 @@ def compute_layer_tau0(cfg, n_HI, T_spin, dl_pc, sigma_kms):
     """Compute peak optical depth for a single layer.
 
     From the HI 21cm line opacity:
-      tau_0 = (3 c^2 A_10) / (8 pi nu_21cm^2) * (n_HI * dl) / (T_spin * sigma_v * sqrt(2*pi))
-    
+      tau_0 = (3 h c^3 A_10) / (32 pi k_B nu_21cm^2)
+              * (n_HI * dl) / (T_spin * sigma_v * sqrt(2*pi))
+
     Returns dimensionless tau_0.
     """
-    const = 3.0 * cfg.c_light**2 * cfg.A_10 / \
-            (8.0 * np.pi * cfg.nu_21cm**2)
+    const = 3.0 * cfg.h_planck * cfg.c_light**3 * cfg.A_10 / \
+            (32.0 * np.pi * cfg.k_B * cfg.nu_21cm**2)
     sigma_cms = sigma_kms * 1e5
     if sigma_cms < 1.0:
         return 0.0
-    return const * n_HI * (dl_pc * cfg.pc_cm) / (T_spin * sigma_cms * np.sqrt(2.0 * np.pi))
+    T_spin_safe = T_spin if T_spin > 1.0 else 1.0
+    return const * n_HI * (dl_pc * cfg.pc_cm) / (T_spin_safe * sigma_cms * np.sqrt(2.0 * np.pi))
 
 
 def inverse_radiative_transfer_pixel(

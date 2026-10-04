@@ -5,7 +5,6 @@ All profiles return arrays evaluated at shell midpoints.
 """
 
 import numpy as np
-from numba import njit
 
 
 def density_plummer(r_mid, rho0, r0, alpha):

@@ -15,9 +15,13 @@ from .profiles import density_plummer, temperature_plummer, \
     abundance_profile_111n, infall_velocity
 from .rt import make_shells, los_path_lengths, radiative_transfer_pixel, \
     inverse_radiative_transfer_pixel
+from .rt_1d import four_layer_absorption_spectrum, four_layer_forward_rt, \
+    compute_tau0, compute_sigma_v
 from .models import build_synthetic_hinsa, inverse_build_hinsa_cube, \
     generate_sim_hinsa, residual_map
 from .fitters import fit_hinspheres, fit_hinsa_model, reload_fit_result
+from .mcmc import run_mcmc, save_corner_plot, save_chain_plot
+from .prepare import prepare_hinspheres_input
 
 __all__ = [
     'Config',
@@ -25,8 +29,12 @@ __all__ = [
     'abundance_profile_111n', 'infall_velocity',
     'make_shells', 'los_path_lengths', 'radiative_transfer_pixel',
     'inverse_radiative_transfer_pixel',
+    'four_layer_absorption_spectrum', 'four_layer_forward_rt',
+    'compute_tau0', 'compute_sigma_v',
     'build_synthetic_hinsa', 'inverse_build_hinsa_cube',
     'generate_sim_hinsa',
     'residual_map', 'fit_hinsa_model', 'fit_hinspheres',
     'reload_fit_result',
+    'run_mcmc', 'save_corner_plot', 'save_chain_plot',
+    'prepare_hinspheres_input',
 ]

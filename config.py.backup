@@ -20,11 +20,7 @@ class Config:
     k_B = 1.380649e-16            # erg/K
     m_H = 1.6735e-24              # g
     m_H2 = 2.0 * 1.6735e-24       # g
-    mu_H = 1.40                   # mean gas mass per H nucleus (incl. He), in
-                                  # units of m_H; X=0.70, Y=0.28, Z=0.02
-                                  # (McKee & Ostriker 2007, ARAA 45, 565).
-                                  # Used for enclosed mass: rho = mu_H * m_H * n_H,
-                                  # where n_H is total H-nucleus density.
+    mu = 2.33                     # mean molecular weight
     G = 6.67430e-8                # cm^3 g^-1 s^-2
     pc_cm = 3.085677581e18        # cm/pc
     M_sun_g = 1.989e33            # g, solar mass
@@ -46,26 +42,10 @@ class Config:
     # ---- Telescope ----
     beam_fwhm_arcmin: float = 3.0  # FAST HI beam
     distance_pc: float = 140.0     # default distance
-    pixel_scale_arcmin: float = 1.5   # synthetic-core spatial pixel scale (arcmin)
-    delta_v_kms: float = 0.2          # synthetic-core velocity channel width (km/s)
-
-    # ---- Fitting window ----
-    fit_velocity_radius_kms: float = 3.0   # fit only ± this around vlsr_kms
-    noise_sigma_K: float = 0.17            # CRAFTS RMS noise per 0.2 km/s channel (Zhang+2019)
 
     # ---- FITS header fallback defaults ----
     default_cdelt_deg: float = 0.025   # fallback pixel scale (degrees) when CDELT1/CDELT2 missing
     default_cdelt3_ms: float = 200.0   # fallback velocity channel width (m/s) when CDELT3 missing
-
-    # ---- Fallback background and grid defaults ----
-    default_bg_temp_K: float = 30.0    # fallback uniform background T_B (K) when no FITS provided
-    default_npix: int = 21             # fallback spatial grid pixels when no FITS provided
-
-    # ---- 1D four-layer model (rt_1d.py) geometry and defaults ----
-    r_core_ratio: float = 0.3          # core radius = R_env * r_core_ratio
-    r_mid_ratio: float = 0.6           # transition radius = R_env * r_mid_ratio
-    r_outer_factor: float = 2.55       # outer envelope radius = R_env * r_outer_factor
-    T_outer_default: float = 58.0      # default outer envelope spin temperature (K)
 
     # ---- Velocity channels ----
     v_min_kms: float = -20.0
@@ -75,17 +55,17 @@ class Config:
 
     # ---- Fitting bounds for CMA-ES ----
     bounds_pc = {
-        'rho0': (5e2, 5e5),   # central density cm^-3
-        'r0': (0.01, 1.2),          # Plummer core radius in pc
+        'rho0': (100.0, 500000.0),   # central density cm^-3
+        'r0': (0.01, 1.0),          # Plummer core radius in pc
         'alpha': (0.5, 4.0),         # Plummer power-law index
         'T0': (5.0, 30.0),           # central temperature K
         'T1': (10.0, 100.0),          # ambient temperature K
-        'rT': (0.01, 1.2),          # temperature transition radius pc
+        'rT': (0.01, 0.3),          # temperature transition radius pc
         
-        'peak_shell': (3, 7),        # HI abundance peak shell (1-indexed)
+        'peak_shell': (4, 7),        # HI abundance peak shell (1-indexed)
         'f_HI_peak': (0.001, 1.0),   # peak shell HI abundance
-        'multipliers': (0.01, 0.999),   # abundance decrease factor per step
-        #'f_HI': (0.0001, 1.0),        # per-shell HI abundance (f_HI mode)
+        'multipliers': (0.01, 1.0),   # abundance decrease factor per step
+        #'f_HI': (0.0001, 0.5),        # per-shell HI abundance (f_HI mode)
         
         'f_ff': (0.0001, 1.0),         # free-fall fraction
         'turb_kms': (0.0001, 5.0),     # turbulence km/s
@@ -96,9 +76,9 @@ class Config:
 
     # ---- Default initial parameters for CMA-ES ----
     default_params = {
-        'rho0': 1.82e4,
-        'r0': 0.138,
-        'alpha': 2.07,
+        'rho0': 5000.0,
+        'r0': 0.1,
+        'alpha': 2.0,
         'T0': 7.0,
         'T1': 80.0,
         'rT': 0.1,
@@ -122,8 +102,7 @@ class Config:
         self._build_shell_radii()
         # Update peak_shell upper bound to match n_shells
         self.bounds_pc = dict(self.__class__.bounds_pc)
-        _ps = self.bounds_pc['peak_shell']
-        self.bounds_pc['peak_shell'] = (_ps[0], max(1, self.n_shells))
+        self.bounds_pc['peak_shell'] = (1, max(1, self.n_shells))
 
     def _build_shell_radii(self):
         """Uniformly spaced shells from 0 to R_out."""
@@ -144,21 +123,3 @@ class Config:
         """Simplified pixel scale assuming Nyquist-sampled beam."""
         arcmin_rad = self.beam_fwhm_arcmin / 60.0 * np.pi / 180.0
         return arcmin_rad * self.distance_pc / 3.0  # ~3 pix per beam
-
-
-def get_cfg_value(cfg, name):
-    """Get a config value from a Config instance (or class) or raise.
-
-    Priority: instance attribute → class attribute → error.
-    Use this in functions that expect a ``cfg`` instance to make sure
-    every numeric parameter is defined in ``config.py``, with no silent
-    hardcoded fallback.
-    """
-    if hasattr(cfg, name):
-        return getattr(cfg, name)
-    if hasattr(Config, name):
-        return getattr(Config, name)
-    raise AttributeError(
-        f"'{name}' is not defined in Config. "
-        f"Add it to hinspheres/config.py."
-    )

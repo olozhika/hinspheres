@@ -4,6 +4,8 @@
 
 独立于 `hinsapack`，可单独使用。`hinsapack` 通过 `prepare_hinspheres_input` 准备数据后，直接调用本包进行拟合。
 
+**数据准备已内置于包中**——无需外部脚本，直接 `from hinspheres import prepare_hinspheres_input` 即可。
+
 ---
 
 ## 安装
@@ -11,6 +13,73 @@
 ```bash
 pip install numpy scipy astropy matplotlib joblib cma
 ```
+
+---
+
+## 零、数据准备
+
+`prepare_hinspheres_input` 是拟合管线的第一步——从 FITS 数据 cube 中提取子区域，拟合多项式基线，生成拟合所需的输入文件。
+
+### 基本用法
+
+```python
+from astropy.coordinates import SkyCoord
+from hinspheres import prepare_hinspheres_input
+
+result = prepare_hinspheres_input(
+    target_id='G206',
+    datacube_path='./ot1_hi_destripe.fits',
+    output_dir='HIfig/hinspheres_input/',
+    center_coord=SkyCoord(ra=206.1, dec=-15.77, unit='deg'),
+    vlsr_kms=9.3,
+    spatial_radius_arcmin=12.0,  # 子 cube 空间半径 (arcmin)
+    velo_radius_kms=15.0,       # 子 cube 速度半径 (km/s)
+    poly_order=5,                # 基线多项式阶数
+    n_jobs=4,                    # 并行核数
+)
+```
+
+### 返回值
+
+`result` 是一个 dict，包含拟合所需的全部文件路径和元数据：
+
+```python
+result['hinsa_map']      # 3D HINSA 吸收 cube (n_v, ny, nx)
+result['T_HI_true']      # 3D 背景 HI 亮温度 cube (n_v, ny, nx)
+result['R_out_pc']        # 云核物理半径 (pc)，直接传给 Config
+result['vlsr_kms']        # 系统速度 (km/s)
+result['pixel_scale_pc']  # 像素物理尺度 (pc/pixel)
+result['output_dir']      # 输出目录
+```
+
+### 参数说明
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `target_id` | 必填 | 目标 ID，用于文件命名 |
+| `datacube_path` | 必填 | HI FITS 数据 cube 路径 |
+| `output_dir` | `'HIfig/hinspheres_input/'` | 输出目录 |
+| `center_coord` | 必填 | `SkyCoord`，子 cube 中心坐标 |
+| `spatial_radius_arcmin` | `12.0` | 子 cube 空间半径 (arcmin) |
+| `velo_radius_kms` | `15.0` | 子 cube 速度半径 (km/s) |
+| `poly_order` | `5` | 基线多项式阶数 |
+| `peak_unmask_radius` | `2` | 峰值壳层 unmask 半径 (像素) |
+| `polyfit_mask_kms` | `-1` | 掩蔽模式：`-1`=简单两阶段交互；`-2`=复杂逐单元网格掩蔽（见下）；`>0`=固定 ±窗口；`0`/`None`=固定 ±3 |
+| `extra_mask_ranges` | `None` | 额外速度区间排除 `[(v1,v2), ...]`；简单交互模式 Stage 2 每两下点击产生一个区间，写入输出 cube 头 `XRMASKCN`/`XRM{k}LO`/`XRM{k}HI`（m/s），`fit_hinsa_model` 残差计算自动剔除 |
+| `vlsr_override` | `None` | 覆盖 Vlsr (km/s)，不填则用谱线拟合 |
+| `distance_override` | `None` | 覆盖距离 (pc) |
+| `fetch_planck_av` | `True` | 是否从 Planck 获取柱密度 |
+
+### 输出文件
+
+| 文件 | 内容 |
+|---|---|
+| `hinsa_map.fits` | 提取的 HINSA 吸收 cube |
+| `T_HI_true.fits` | 背景 HI 亮温度 cube |
+| `baseline.fits` | 多项式拟合基线 cube |
+| `mask.fits` | 自动+交互 mask |
+| `metadata.json` | 所有参数和路径 |
+| `diagnostic.png` | 诊断图（空间/速度切片） |
 
 ---
 
@@ -241,7 +310,7 @@ out_cube = build_synthetic_hinsa(cfg, params, bg_cube,
 ```python
 result = generate_sim_hinsa(
     ...,
-    spatial_res_pc=0.17,   # 平滑到 FAST 4' beam 在 1290pc 处的分辨率
+    spatial_res_arcmin=4.0,   # 平滑到 FAST 4' beam
     vel_res_kms=0.3,       # 平滑速度分辨率到 0.3 km/s
 )
 ```
@@ -320,28 +389,29 @@ best_params, history, param_stds = fit_hinspheres(
 
 | 参数 | 下界 | 上界 | 说明 |
 |---|---|---|---|
-| `rho0` | 100 cm⁻³ | 100000 cm⁻³ | log10 尺度优化 |
-| `r0` | 0.01 pc | 0.15 pc | Plummer 核半径 |
-| `alpha` | 1.0 | 5.0 | 密度幂律指数 |
+| `rho0` | 500 cm⁻³ | 500000 cm⁻³ | log10 尺度优化 |
+| `r0` | 0.01 pc | 1.2 pc | Plummer 核半径 |
+| `alpha` | 0.5 | 4.0 | 密度幂律指数 |
 | `T0` | 5.0 K | 30.0 K | 中心温度 |
-| `T1` | 10.0 K | 80.0 K | 环境温度 |
-| `rT` | 0.01 pc | 0.15 pc | 温度转变半径 |
-| `peak_shell` | 1 | 9 | 丰度峰值壳层 |
-| `multipliers` | 0.1 | 1.0 | 丰度递减因子 |
-| `f_ff` | 0.01 | 0.5 | 自由下落分数 |
-| `turb_kms` | 0.05 km/s | 0.5 km/s | 湍流速度 |
-| `v_offset` | -3 km/s | +3 km/s | 速度偏移 |
-| `v_rot_kms` | 0 km/s | 5 km/s | 旋转速度 |
+| `T1` | 10.0 K | 100.0 K | 环境温度 |
+| `rT` | 0.01 pc | 1.2 pc | 温度转变半径 |
+| `peak_shell` | 4 | n_shells | 丰度峰值壳层（整数，网格扫描） |
+| `f_HI_peak` | 0.001 | 1.0 | 峰值壳层 HI 丰度 |
+| `multipliers` | 0.01 | 0.999 | 丰度递减因子 |
+| `f_ff` | 0.0001 | 1.0 | 自由下落分数 |
+| `turb_kms` | 0.0001 km/s | 5.0 km/s | 湍流速度 |
+| `v_offset` | -2 km/s | +2 km/s | 速度偏移 |
+| `v_rot_kms` | -5 km/s | 5 km/s | 旋转速度 |
 | `rot_pa_deg` | 0° | 180° | 旋转轴位置角 |
 
-默认 n_shells=9 时，CMA-ES 优化维度 = 11 + 7 + 2 = **20**。
+`peak_shell` 为整数参数，算法对其做网格扫描（每个候选值触发独立 CMA-ES），其余 13 个连续参数由 CMA-ES 优化。
 
 ### 残差权重
 
 CMA-ES 拟合最小化的残差为：
 
 ```
-R = Σ[ w(j,i) · (obs(j,i) − model(j,i))² / |obs(j,i)| ] / Σ w(j,i)
+R = Σ[ w(j,i) · (obs(j,i) − model(j,i))² ] / Σ w(j,i)
 ```
 
 其中 **径向权重** `w(j,i)` 定义为：
@@ -397,7 +467,7 @@ for k, v in result['best_params'].items():
 标准正向建模：需要 `obs_background_fits`（未吸收的背景 HI 亮温度 cube），残差为：
 
 ```
-R = Σ[ w(j,i) · (obs(j,i) − model(j,i))² / |obs(j,i)| ] / Σ w(j,i)
+R = Σ[ w(j,i) · (obs(j,i) − model(j,i))² ] / Σ w(j,i)
 ```
 
 其中 `model` 是正向 RT 模型输出。背景 cube 由 `prepare_hinspheres_input` 生成。
@@ -441,27 +511,89 @@ result_sd = fit_hinsa_model(
 )
 ```
 
----
+### 额外速度区间排除：`extra_mask_ranges_kms`
 
-## 四、与 hinsapack 的协作
+速度轴上可能有多个 HINSA 结构，而我们只关心其中一个。`prepare` 交互模式的
+**Stage 2**（点两下加一个排除区，可多个，Enter 结束）会把排除区写进 cube 头
+（`XRMASKCN`/`XRM{k}LO`/`XRM{k}HI`，m/s），`fit_hinsa_model` 自动读取并在
+**优化目标与最终残差**中剔除这些速度通道。
+
+自带数据/背景的用户（无 `prepare` 产出的头关键字）直接传同单位参数即可，
+效果完全相同：
 
 ```python
-import hinsapack as hp
-from hinspheres import fit_hinspheres, Config
-
-# 1. hinsapack 准备数据
-result = hp.prepare_hinspheres_input(
-    target_id='G206.10-15.77',
-    output_dir='HIfig/hinspheres_input/',
+result = fit_hinsa_model(
+    obs_hinsa_fits='my_obs.fits',
+    obs_background_fits='my_bg.fits',   # 自带背景
+    mode='forward',
+    fit_velocity_radius_kms=3.0,        # 主拟合窗口（±3 km/s）
+    extra_mask_ranges_kms=[(-8.0, -4.0), (6.0, 9.0)],  # 额外排除区
 )
-
-# 2. hinspheres 拟合
-cfg = Config(n_shells=9, R_out_pc=result['R_out_pc'],
-             vlsr_kms=result['vlsr_kms'])
-best_params, _ = fit_hinspheres(cfg, result['hinsa_map'], result['T_HI_true'])
 ```
 
+两条通道取并集：头内 `XRM*` ∪ `extra_mask_ranges_kms`，均以 km/s 归一。
+
+### 复杂模式：逐单元网格掩蔽（`polyfit_mask_kms=-2`）
+
+对核心与周围**线宽不同**、或不同区域需要不同掩蔽的云核，`prepare` 提供逐单元掩蔽：
+
+- 打开一张 **3×3 bin 谱的空间图**（每 3×3 像素一个 bin 谱，类似 `grid_spectra_polyfit.png`）。
+- **Stage 1**：点一个单元 → 在右侧编辑面板点两下设定该单元的主 HINSA mask；可对多个单元操作，
+  再点已设单元可重设，右键/Esc 清除；按 **E** 进入 Stage 2。
+- **Stage 2**：点单元 → 点"两两成对"加排除区，Enter 退出该单元，可继续下一个；按 **E** 结束。
+- 主 mask 由锚点单元经 **IDW（反距离加权）** 插值到每个像素；排除区按逐通道加权占比
+  （`frac ≥ 0.5` 排除）插值，锚点处精确、空间平滑过渡。
+- 排除区以 **0/1 EXMASK cube**（0=排除）内嵌进背景 FITS 的 `EXMASK` 扩展，
+  `fit_hinsa_model` 自动读取并在**优化目标与最终残差**中逐像素剔除——比逐条写头关键字简洁得多。
+- 额外输出：`{T}_mask_anchors.json`、`{T}_hinsa_masklo/hi.fits`。
+
+```python
+result = prepare_hinspheres_input(
+    target_id='L1574',
+    datacube_path='./ot1_hi_destripe.fits',
+    output_dir='hinspheres_input/',
+    center_coord=SkyCoord(ra=92.02083, dec=18.56, unit='deg'),
+    vlsr_override=0.0,
+    polyfit_mask_kms=-2,        # 复杂逐单元网格掩蔽
+)
+```
+
+> 兼容性：`-1`（简单交互）与 `>0`（固定窗口）模式完全不变；旧背景 FITS（无 `EXMASK`
+> 扩展）读入时 `fit_hinsa_model` 自动走原 `XRM*`/`extra_mask_ranges_kms` 路径。
+
 ---
+
+## 四、完整工作流示例
+
+
+```python
+from astropy.coordinates import SkyCoord
+from hinspheres import Config, fit_hinspheres, prepare_hinspheres_input
+
+# 1. 数据准备（子 cube 提取 + 基线拟合）
+result = prepare_hinspheres_input(
+    target_id='G206',
+    datacube_path='./ot1_hi_destripe.fits',
+    output_dir='HIfig/hinspheres_input/',
+    center_coord=SkyCoord(ra=206.1, dec=-15.77, unit='deg'),
+    vlsr_kms=9.3,
+    spatial_radius_arcmin=12.0,
+    velo_radius_kms=15.0,
+)
+
+# 2. 拟合
+cfg = Config(n_shells=9, R_out_pc=result['R_out_pc'],
+             vlsr_kms=result['vlsr_kms'])
+best_params, history, param_stds = fit_hinspheres(
+    cfg=cfg,
+    obs_hinsa_map=result['hinsa_map'],
+    T_HI_true_map=result['T_HI_true'],
+    max_gen=200,
+    popsize=24,
+    n_jobs=4,
+)
+```
+
 
 ## 五、包结构
 
@@ -473,6 +605,7 @@ hinspheres/
 ├── rt.py            # 光线追踪与辐射转移 (含 inverse RT)
 ├── models.py        # 正向建模 (build_synthetic_hinsa, inverse_build_hinsa_cube)
 ├── fitters.py       # CMA-ES 拟合器 (fit_hinsa_model, reload_fit_result)
+├── prepare.py       # 数据准备 (prepare_hinspheres_input)
 └── utils.py         # 诊断图
 ```
 
