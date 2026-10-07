@@ -124,6 +124,11 @@ class Config:
         self.bounds_pc = dict(self.__class__.bounds_pc)
         _ps = self.bounds_pc['peak_shell']
         self.bounds_pc['peak_shell'] = (_ps[0], max(1, self.n_shells))
+        # Cap rT upper bound at R_out: the temperature transition radius
+        # must lie inside the modeled cloud, so T1 stays interpretable
+        # as the envelope temperature (T(R_out) = (T0+T1)/2 when rT = R_out).
+        _rt = self.bounds_pc['rT']
+        self.bounds_pc['rT'] = (_rt[0], min(_rt[1], self.R_out_pc))
 
     def _build_shell_radii(self):
         """Uniformly spaced shells from 0 to R_out."""

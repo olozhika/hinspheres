@@ -884,6 +884,211 @@ def _interactive_mask_selection(using_data, velo_kms, vlsr_kms, target_id):
     return mask_lo, mask_hi, extra_ranges, has_hinsa
 
 
+def _preview_bg_fit(using_data, pure_hinsa, velo_kms, vlsr_kms, target_id,
+                    mask_lo_kms, mask_hi_kms, extra_ranges_kms,
+                    _auto_events=None):
+    """
+    Interactive preview of the fitted HI background (simple mask mode).
+
+    Shows a 3x3-binned grid of observed (blue) vs fitted background (orange)
+    spectra, in the same layout as the saved *_grid_spectra_polyfit.png.
+    Click a grid cell to zoom its spectrum in the right panel (main HINSA
+    mask shaded orange, excluded regions magenta).
+
+    Keys:
+      Enter / E / Esc : accept the fit and continue
+      R               : redo the mask settings (return to mask selection)
+
+    `_auto_events` is a test hook: a list of ('key', 'e') /
+    ('click', x_data, y_data) items fired ~0.5 s after the window opens.
+
+    Returns 'accept' or 'redo'.
+    """
+    import matplotlib
+    _orig_backend = matplotlib.get_backend().lower()
+    _in_jupyter = ('zmq' in _orig_backend or 'ipympl' in _orig_backend
+                   or 'nbagg' in _orig_backend or 'inline' in _orig_backend
+                   or 'ipykernel' in sys.modules)
+    _has_display = os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')
+
+    if _in_jupyter:
+        matplotlib.use('nbagg')
+    elif _has_display:
+        try:
+            matplotlib.use('TkAgg')
+        except Exception:
+            try:
+                matplotlib.use('Qt5Agg')
+            except Exception:
+                print("[Preview] No interactive backend; accepting background fit.")
+                return 'accept'
+    else:
+        print("[Preview] No display (headless); accepting background fit.")
+        return 'accept'
+
+    from matplotlib import pyplot as plt
+    from matplotlib.gridspec import GridSpec
+
+    n_v, ny, nx = using_data.shape
+    velo_kms = np.asarray(velo_kms, dtype=float)
+    if velo_kms[-1] < velo_kms[0]:
+        velo_kms = velo_kms[::-1]
+        using_data = using_data[::-1]
+        pure_hinsa = pure_hinsa[::-1]
+
+    bg_cube = using_data + pure_hinsa   # fitted HI background (T_HI_true)
+
+    bg_map = np.nanmean(using_data, axis=0)
+    vbg_lo, vbg_hi = np.nanpercentile(bg_map, [2, 98])
+
+    fig = plt.figure(figsize=(13.5, 7))
+    gs = GridSpec(1, 2, figure=fig, width_ratios=[1.2, 1.0], wspace=0.16)
+    ax_grid = fig.add_subplot(gs[0])
+    ax_zoom = fig.add_subplot(gs[1])
+
+    ax_grid.imshow(bg_map, origin='lower', cmap='cividis',
+                   vmin=vbg_lo, vmax=vbg_hi, aspect='equal', alpha=0.3)
+
+    cell3 = 3
+    cells = {}   # (iy, ix) -> {'x0','y0','x1','y1','obs','bg'}
+    for x0 in range(0, nx, cell3):
+        for y0 in range(0, ny, cell3):
+            x1 = min(x0 + cell3, nx)
+            y1 = min(y0 + cell3, ny)
+            cells[(y0 // cell3, x0 // cell3)] = {
+                'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1,
+                'obs': np.nanmean(using_data[:, y0:y1, x0:x1], axis=(1, 2)),
+                'bg': np.nanmean(bg_cube[:, y0:y1, x0:x1], axis=(1, 2)),
+            }
+
+    if cells:
+        all_lo = min(np.nanmin(c['obs']) for c in cells.values())
+        all_hi = max(np.nanmax(c['obs']) for c in cells.values())
+        margin = max((all_hi - all_lo) * 0.15, 1.0)
+        ylo, yhi = all_lo - margin, all_hi + margin
+    else:
+        ylo, yhi = 0.0, 10.0
+
+    inset_of = {}   # id(inset axes) -> cell key
+    for key, c in cells.items():
+        ins = ax_grid.inset_axes(
+            [c['x0'] - 0.5, c['y0'] - 0.5,
+             c['x1'] - c['x0'], c['y1'] - c['y0']],
+            transform=ax_grid.transData)
+        ins.plot(velo_kms, c['obs'], '-', color='#3366cc', lw=0.6)
+        ins.plot(velo_kms, c['bg'], '-', color='darkorange', lw=0.6)
+        ins.axvline(vlsr_kms, ls='--', color='0.5', alpha=0.3, lw=0.3)
+        ins.set_ylim(ylo, yhi)
+        ins.set_xlim(velo_kms[0], velo_kms[-1])
+        ins.tick_params(length=0, labelleft=False, labelbottom=False)
+        ins.set_facecolor('none')
+        for spn in ins.spines.values():
+            spn.set_visible(False)
+        inset_of[id(ins)] = key
+
+    ax_grid.set_xlim(-0.5, nx - 0.5)
+    ax_grid.set_ylim(-0.5, ny - 0.5)
+    ax_grid.set_xlabel('Pixel X')
+    ax_grid.set_ylabel('Pixel Y')
+    ax_grid.set_title(f'{target_id} — background fit preview\n'
+                      'click a cell to zoom · Enter/E/Esc: accept · R: redo')
+
+    ax_zoom.set_xlabel('V$_{\\rm LSR}$ (km s$^{-1}$)')
+    ax_zoom.set_ylabel('T$_\\mathrm{B}$ (K)')
+    ax_zoom.grid(True, alpha=0.3)
+    ax_zoom.text(0.5, 0.5, 'Click a grid cell\nto zoom in',
+                 ha='center', va='center', transform=ax_zoom.transAxes,
+                 fontsize=12, color='0.4')
+
+    decision = {'val': None}
+
+    def _show_zoom(key):
+        c = cells[key]
+        ax_zoom.cla()
+        ax_zoom.plot(velo_kms, c['obs'], '-', color='#3366cc', lw=1.4,
+                     label='Observed')
+        ax_zoom.plot(velo_kms, c['bg'], '-', color='darkorange', lw=1.4,
+                     label='Fitted background')
+        ax_zoom.axvspan(mask_lo_kms, mask_hi_kms, color='orange', alpha=0.12,
+                        label='HINSA mask')
+        for k_e, (elo, ehi) in enumerate(extra_ranges_kms):
+            ax_zoom.axvspan(elo, ehi, color='magenta', alpha=0.12,
+                            label='Excluded' if k_e == 0 else None)
+        ax_zoom.axvline(vlsr_kms, ls='--', color='red', alpha=0.6,
+                        label=f'V_LSR={vlsr_kms:.1f}')
+        ax_zoom.set_xlim(velo_kms[0], velo_kms[-1])
+        ax_zoom.set_xlabel('V$_{\\rm LSR}$ (km s$^{-1}$)')
+        ax_zoom.set_ylabel('T$_\\mathrm{B}$ (K)')
+        ax_zoom.set_title(f'Cell x[{c["x0"]}:{c["x1"]}], y[{c["y0"]}:{c["y1"]}]')
+        ax_zoom.grid(True, alpha=0.3)
+        ax_zoom.legend(fontsize=8, loc='lower left')
+        fig.canvas.draw_idle()
+
+    def _on_click(event):
+        if decision['val'] is not None or event.xdata is None:
+            return
+        key = None
+        if event.inaxes is not None and id(event.inaxes) in inset_of:
+            key = inset_of[id(event.inaxes)]
+        elif event.inaxes == ax_grid:
+            ix = int(np.floor(event.xdata / cell3))
+            iy = int(np.floor(event.ydata / cell3))
+            if (iy, ix) in cells:
+                key = (iy, ix)
+        if key is not None:
+            _show_zoom(key)
+            c = cells[key]
+            print(f'  [Preview] Zoomed cell x[{c["x0"]}:{c["x1"]}], '
+                  f'y[{c["y0"]}:{c["y1"]}]')
+
+    def _on_key(event):
+        if decision['val'] is not None:
+            return
+        if event.key in ('enter', 'return', 'e', 'E', 'escape'):
+            decision['val'] = 'accept'
+        elif event.key in ('r', 'R'):
+            decision['val'] = 'redo'
+        if decision['val'] is not None:
+            fig.canvas.mpl_disconnect(cid)
+            fig.canvas.mpl_disconnect(cid_key)
+            plt.close(fig)
+            print(f'  [Preview] {decision["val"].upper()}')
+
+    print('\n  [Background preview] Grid: observed (blue) vs fitted background '
+          '(orange), same layout as the saved grid PNG.')
+    print('  Click a cell to zoom (masks shaded in the right panel).')
+    print('  Press Enter / E / Esc to accept the fit, or R to redo the mask '
+          'settings.\n')
+
+    cid = fig.canvas.mpl_connect('button_press_event', _on_click)
+    cid_key = fig.canvas.mpl_connect('key_press_event', _on_key)
+
+    if _auto_events:
+        from matplotlib.backend_bases import KeyEvent, MouseEvent
+        ax_c = ax_grid.transData.transform
+        for _ev in _auto_events:
+            if _ev[0] == 'click':
+                _px, _py = ax_c((_ev[1], _ev[2]))
+                fig.canvas.callbacks.process(
+                    'button_press_event',
+                    MouseEvent('button_press_event', fig.canvas,
+                               _px, _py, button=1))
+            else:
+                fig.canvas.callbacks.process(
+                    'key_press_event',
+                    KeyEvent('key_press_event', fig.canvas, key=_ev[1]))
+
+    plt.show()
+
+    while decision['val'] is None and plt.fignum_exists(fig.number):
+        plt.pause(0.1)
+    if decision['val'] is None:
+        decision['val'] = 'accept'
+        print('  [Preview] Figure closed without a choice; accepting.')
+    matplotlib.use(_orig_backend)
+    return decision['val']
+
+
 # ---------------------------------------------------------------------------
 # Grid spectra plotting (replaces hinsapack.pipeline._plot_grid_spectra_polyfit)
 # ---------------------------------------------------------------------------
@@ -1085,7 +1290,10 @@ def prepare_hinspheres_input(target_id, datacube_path,
         structures) are excluded from background fit and residual
         computation.  Set to a positive value (e.g. 3.0) to skip the
         interactive GUI and use a fixed ±polyfit_mask_kms range.
-        Default is -1 (interactive).
+        Default is -1 (interactive).  After the pixelwise background fit,
+        an interactive grid preview of the fitted background is shown:
+        click a cell to zoom, Enter/E/Esc accepts the fit, R returns to
+        the mask selection to redo the settings.
     polyfit_mask_kms : float, optional (complex mode)
         Set to -2 to enable the complex per-cell mask mode: a map of
         3x3-binned spectra is shown; each cell's main HINSA mask and extra
@@ -1207,31 +1415,42 @@ def prepare_hinspheres_input(target_id, datacube_path,
             pure_hinsa[:, j, i] = results[idx]
         pure_hinsa = -pure_hinsa
     elif polyfit_mask_kms == -1:
-        mask_lo_kms, mask_hi_kms, extra_ranges_kms, has_hinsa = _interactive_mask_selection(
-            using_data, velo_kms, vlsr_kms_val, target_id)
-        if not has_hinsa:
-            print(f"  Skipping {target_id} (no HINSA)")
-            return None
-        mask_lo_ms = mask_lo_kms * 1000.0
-        mask_hi_ms = mask_hi_kms * 1000.0
-        extra_ranges_ms = [(lo * 1000.0, hi * 1000.0) for (lo, hi) in extra_ranges_kms]
-
         from joblib import Parallel, delayed
-
-        def _fit_pixel_mask(j, i):
-            return _get_pure_hinsa_by_3polyfit(
-                using_data[:, j, i], velo_range,
-                [mask_lo_ms, mask_hi_ms],
-                poly_order=poly_order,
-                extra_mask_ranges=extra_ranges_ms)
-
         ny, nx = using_data.shape[1], using_data.shape[2]
-        results = Parallel(n_jobs=4, prefer='threads')(
-            delayed(_fit_pixel_mask)(j, i) for j in range(ny) for i in range(nx))
-        pure_hinsa = np.zeros(using_data.shape)
-        for idx, (j, i) in enumerate([(j, i) for j in range(ny) for i in range(nx)]):
-            pure_hinsa[:, j, i] = results[idx]
-        pure_hinsa = -pure_hinsa
+        while True:
+            mask_lo_kms, mask_hi_kms, extra_ranges_kms, has_hinsa = \
+                _interactive_mask_selection(
+                    using_data, velo_kms, vlsr_kms_val, target_id)
+            if not has_hinsa:
+                print(f"  Skipping {target_id} (no HINSA)")
+                return None
+            mask_lo_ms = mask_lo_kms * 1000.0
+            mask_hi_ms = mask_hi_kms * 1000.0
+            extra_ranges_ms = [(lo * 1000.0, hi * 1000.0)
+                               for (lo, hi) in extra_ranges_kms]
+
+            def _fit_pixel_mask(j, i):
+                return _get_pure_hinsa_by_3polyfit(
+                    using_data[:, j, i], velo_range,
+                    [mask_lo_ms, mask_hi_ms],
+                    poly_order=poly_order,
+                    extra_mask_ranges=extra_ranges_ms)
+
+            results = Parallel(n_jobs=4, prefer='threads')(
+                delayed(_fit_pixel_mask)(j, i)
+                for j in range(ny) for i in range(nx))
+            pure_hinsa = np.zeros(using_data.shape)
+            for idx, (j, i) in enumerate(
+                    [(j, i) for j in range(ny) for i in range(nx)]):
+                pure_hinsa[:, j, i] = results[idx]
+            pure_hinsa = -pure_hinsa
+
+            decision = _preview_bg_fit(
+                using_data, pure_hinsa, velo_kms, vlsr_kms_val, target_id,
+                mask_lo_kms, mask_hi_kms, extra_ranges_kms)
+            if decision == 'accept':
+                break
+            print("  [Preview] Redoing mask settings ...")
     else:
         ignore_radius_ms = polyfit_mask_kms * 1000.0
         pure_hinsa = _get_pure_hinsa_cube(

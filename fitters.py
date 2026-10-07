@@ -235,6 +235,9 @@ def _optimize_cmaes(cfg, obs_map, T_HI_true, params_init,
     r_map_pc = r_map * pixel_scale_pc
     r_map_pc[r_map_pc == 0] = pixel_scale_pc  # center → same weight as r=1 pixel
     weight_map = 1.0 / r_map_pc ** cfg.weight_index
+    # Restrict objective to r <= R_out (paper Sec. 3.2, eq. 14)
+    if R_out_pc is not None:
+        weight_map[r_map_pc > R_out_pc] = 0.0
 
     # --- Compute velocity axis (always needed for build_synthetic_hinsa) ---
     crval3 = obs_hdr.get('CRVAL3', 0.0) if obs_hdr is not None else 0.0
@@ -1029,7 +1032,10 @@ def fit_hinsa_model(obs_hinsa_fits, obs_background_fits=None,
                               ((xx_f - center_yx[1]).astype(float))**2)
             r_map_pc_f = r_map_f * pixel_scale_pc
             r_map_pc_f[r_map_pc_f == 0] = pixel_scale_pc
-            wm3 = (1.0 / r_map_pc_f ** cfg.weight_index)[np.newaxis, :, :]
+            w2d_f = 1.0 / r_map_pc_f ** cfg.weight_index
+            if R_out_pc is not None:
+                w2d_f[r_map_pc_f > R_out_pc] = 0.0
+            wm3 = w2d_f[np.newaxis, :, :]
             wm3 = np.broadcast_to(wm3, mc.shape).copy()
             if fit_velocity_radius_kms is not None or h_obs is not None or _exmask_cube is not None:
                 _excl = _build_velo_exclusion_mask_3d(
@@ -1044,6 +1050,8 @@ def fit_hinsa_model(obs_hinsa_fits, obs_background_fits=None,
             r_map_pc_f = r_map_f * pixel_scale_pc
             r_map_pc_f[r_map_pc_f == 0] = pixel_scale_pc
             weight_map_f = 1.0 / r_map_pc_f ** cfg.weight_index
+            if R_out_pc is not None:
+                weight_map_f[r_map_pc_f > R_out_pc] = 0.0
             mc_use = mc
             obs_use = obs_hinsa_cube
             if fit_velocity_radius_kms is not None or h_obs is not None or _exmask_cube is not None:
@@ -1243,6 +1251,8 @@ def fit_hinsa_model(obs_hinsa_fits, obs_background_fits=None,
         r_map_pc_f = r_map_f * pixel_scale_pc
         r_map_pc_f[r_map_pc_f == 0] = pixel_scale_pc
         weight_map_f = 1.0 / r_map_pc_f ** cfg.weight_index
+        if R_out_pc is not None:
+            weight_map_f[r_map_pc_f > R_out_pc] = 0.0
 
         if mode == 'second_derivative':
             _s_fwhm2sig = _FWHM2SIG
@@ -1463,6 +1473,8 @@ def fit_hinsa_model(obs_hinsa_fits, obs_background_fits=None,
         r_map_pc_m = r_map_m * pixel_scale_pc
         r_map_pc_m[r_map_pc_m == 0] = pixel_scale_pc
         weight_map_mcmc = 1.0 / r_map_pc_m
+        if R_out_pc is not None:
+            weight_map_mcmc[r_map_pc_m > R_out_pc] = 0.0
 
         mcmc_result = run_mcmc(
             best_params=best_params,
