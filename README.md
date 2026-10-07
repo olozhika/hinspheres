@@ -226,7 +226,4 @@ hinspheres/
 
 ## References
 
-- Goldsmith, P. F. 2007, ApJ, 668, 1043
-- Li, D. & Goldsmith, P. F. 2003, ApJ, 585, 823
-- Liu, T. et al. 2021, ApJS, 252, 5
-- Zuo, P. et al. 2018, ApJ, 858, 89
+TBC
