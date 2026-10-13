@@ -1,8 +1,8 @@
 # hinspheres
 
-Forward radiative-transfer modeling and fitting of HINSA (H I Narrow Self-Absorption) in cold cloud cores.
+Forward radiative-transfer modeling and fitting of HINSA (H I Narrow Self-Absorption) in cold cores.
 
-`hinspheres` builds a spherically symmetric, multi-shell 21-cm absorption model of a cloud core (Plummer density and spin-temperature profiles, shell-wise HI abundance, infall and rotation kinematics), synthesizes absorption cubes against any background HI survey, and recovers the physical parameters of observed cubes with CMA-ES optimization, optionally refined with emcee MCMC. Data preparation from raw FITS cubes is built in. The package runs standalone or as the fitting backend of the `hinsapack` pipeline through `prepare_hinspheres_input`.
+`hinspheres` builds a spherically symmetric, multi-shell 21-cm absorption model of a core (Plummer density and spin-temperature profiles, shell-wise HI abundance, infall and rotation kinematics), synthesizes absorption cubes against any background HI survey, and recovers the physical parameters of observed cubes with CMA-ES optimization, optionally refined with emcee MCMC. Data preparation from raw FITS cubes is built in. The package runs standalone or as the fitting backend of the `hinsapack` pipeline through `prepare_hinspheres_input`.
 
 ## Installation
 
