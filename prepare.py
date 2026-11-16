@@ -113,8 +113,13 @@ def _extract_hi_subcube(datacube_fits, ra_deg, dec_deg, vlsr_ms,
         hdu = hdul[0]
         hdr = hdu.header
 
-        velocity_axis = (np.arange(0.0, hdr['NAXIS3']) * hdr.get('CDELT3', 1.0)
-                         + hdr.get('CRVAL3', 0.0))
+        # FITS spectral axis: v(i) = CRVAL3 + (i - (CRPIX3 - 1)) * CDELT3.
+        # CRPIX3 must be included (stitched CRAFTS cubes carry CRPIX3 < 0),
+        # otherwise the axis is offset by (CRPIX3 - 1) * CDELT3.
+        _crpix3 = hdr.get('CRPIX3', 1.0)
+        velocity_axis = (hdr.get('CRVAL3', 0.0)
+                         + (np.arange(0.0, hdr['NAXIS3']) - (_crpix3 - 1.0))
+                         * hdr.get('CDELT3', 1.0))
 
         lim, using_data = _get_using_data(
             hdu, ra_deg, dec_deg, vlsr_ms,
@@ -800,7 +805,8 @@ def _interactive_mask_selection(using_data, velo_kms, vlsr_kms, target_id):
     ax2.tick_params(axis='y', labelsize=8)
     ax2.text(0.02, 0.90, '(HINSA -> W-shaped dip)', transform=ax2.transAxes,
              fontsize=8, va='top', color='crimson', alpha=0.7)
-
+    ax2.set_xlim(np.nanmin(velo_kms), np.nanmax(velo_kms))
+    
     main_clicked = []
     extra_ranges = []
     pending_extra = []
