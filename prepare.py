@@ -49,10 +49,14 @@ def _make_wcs2d(header):
     return wcs_header
 
 
-def _make_wcscut(lim, wcs2d):
-    """Shift CRPIX after cropping a spatial sub-region."""
-    wcs2d.wcs.crpix[0] = wcs2d.wcs.crpix[0] - round(lim[0][0])
-    wcs2d.wcs.crpix[1] = wcs2d.wcs.crpix[1] - round(lim[1][0])
+def _make_wcscut(x0, y0, wcs2d):
+    """Shift CRPIX after cropping a spatial sub-region.
+
+    ``x0``/``y0`` must be the ACTUAL first pixel kept (after clamping to the
+    cube edges), not the requested (possibly negative) cut start.
+    """
+    wcs2d.wcs.crpix[0] = wcs2d.wcs.crpix[0] - x0
+    wcs2d.wcs.crpix[1] = wcs2d.wcs.crpix[1] - y0
     return wcs2d
 
 
@@ -126,7 +130,9 @@ def _extract_hi_subcube(datacube_fits, ra_deg, dec_deg, vlsr_ms,
             spatial_radius_arcmin, spatial_radius_arcmin, velo_radius_ms,
         )
 
-        wcs2d = _make_wcscut(lim, WCS(_make_wcs2d(hdr)))
+        wcs2d = _make_wcscut(max(0, round(min(lim[0]))),
+                             max(0, round(min(lim[1]))),
+                             WCS(_make_wcs2d(hdr)))
 
         z_start = max(0, round(min(lim[2])))
         z_end = min(len(velocity_axis), round(max(lim[2])) + 1)
@@ -805,8 +811,10 @@ def _interactive_mask_selection(using_data, velo_kms, vlsr_kms, target_id):
     ax2.tick_params(axis='y', labelsize=8)
     ax2.text(0.02, 0.90, '(HINSA -> W-shaped dip)', transform=ax2.transAxes,
              fontsize=8, va='top', color='crimson', alpha=0.7)
+    # Restrict the view to the extracted velocity window (keeps a V_LSR line
+    # outside the window from stretching the axis and leaving a large blank).
     ax2.set_xlim(np.nanmin(velo_kms), np.nanmax(velo_kms))
-    
+
     main_clicked = []
     extra_ranges = []
     pending_extra = []
