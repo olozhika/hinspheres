@@ -9,7 +9,7 @@ class Config:
     """Global configuration for sphere geometry, physics, and fitting bounds."""
 
     # ---- Spherical shells ----
-    n_shells: int = 7
+    n_shells: int = 7           
     R_out_pc: float = 3.        # total cloud radius in pc
 
     # ---- Fitting weight ----
@@ -38,6 +38,7 @@ class Config:
 
     # ---- Galactic HI foreground (Li & Goldsmith 2003) ----
     #[SET tau_h_total TO ZERO TO 禁用 FOREGROUND Section]
+    # don't use it!!! please keep tau_h_total at 0
     tau_h_total: float = 0.0       # total galactic HI optical depth along LOS 
     T_HI_galactic: float = 100.0   # galactic HI spin temperature (K), CNM+WNM effective spin temperature, opacity-weighted. 
     p_min: float = 0.7             # minimum background fraction p (Li 2003 default)
@@ -45,23 +46,24 @@ class Config:
 
     # ---- Telescope ----
     beam_fwhm_arcmin: float = 3.0  # FAST HI beam
-    distance_pc: float = 140.0     # default distance
+    distance_pc: float = 140.0     # default distance, so you should always change it (you can change it in the fitting command)
     pixel_scale_arcmin: float = 1.5   # synthetic-core spatial pixel scale (arcmin)
     delta_v_kms: float = 0.2          # synthetic-core velocity channel width (km/s)
 
     # ---- Fitting window ----
     fit_velocity_radius_kms: float = 3.0   # fit only ± this around vlsr_kms
-    noise_sigma_K: float = 0.17            # CRAFTS RMS noise per 0.2 km/s channel (Zhang+2019)
+    noise_sigma_K: float = 0.17            # CRAFTS RMS noise per 0.2 km/s channel
 
-    # ---- FITS header fallback defaults ----
+    # ---- FITS header fallback defaults ---- usually you dont have to change these, they are just fallback numbers
     default_cdelt_deg: float = 0.025   # fallback pixel scale (degrees) when CDELT1/CDELT2 missing
     default_cdelt3_ms: float = 200.0   # fallback velocity channel width (m/s) when CDELT3 missing
 
-    # ---- Fallback background and grid defaults ----
+    # ---- Fallback background and grid defaults ---- usually you dont have to change these, they are just fallback numbers
     default_bg_temp_K: float = 30.0    # fallback uniform background T_B (K) when no FITS provided
     default_npix: int = 21             # fallback spatial grid pixels when no FITS provided
 
     # ---- 1D four-layer model (rt_1d.py) geometry and defaults ----
+    # dont use rt_1d.py, it's 半成品
     r_core_ratio: float = 0.3          # core radius = R_env * r_core_ratio
     r_mid_ratio: float = 0.6           # transition radius = R_env * r_mid_ratio
     r_outer_factor: float = 2.55       # outer envelope radius = R_env * r_outer_factor
@@ -74,6 +76,7 @@ class Config:
     vlsr_kms: float = 0.0            # cloud systemic velocity (km/s), set from catalog
 
     # ---- Fitting bounds for CMA-ES ----
+    # set 'rho0': (1e4, 1e4) to fix rho0 (others are the same)
     bounds_pc = {
         'rho0': (5e2, 5e5),   # central density cm^-3
         'r0': (0.01, 1.2),          # Plummer core radius in pc
