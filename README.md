@@ -60,26 +60,8 @@ Output files: `hinsa_map.fits`, `T_HI_true.fits`, `baseline.fits`, `mask.fits`, 
 
 ### 2. Fit
 
-```python
-from hinspheres import Config, fit_hinspheres
 
-cfg = Config(
-    n_shells=9,
-    R_out_pc=result['R_out_pc'],
-    vlsr_kms=result['vlsr_kms'],
-    v_min_kms=-10.0, v_max_kms=25.0,
-    n_v_channels=301,
-)
-
-best_params, history, param_stds = fit_hinspheres(
-    cfg=cfg,
-    obs_hinsa_map=result['hinsa_map'],       # 3D observed cube
-    T_HI_true_map=result['T_HI_true'],       # 3D background cube
-    max_gen=200,
-    popsize=24,
-    n_jobs=4,
-)
-```
+Please check `config.py` before fitting! (although you can overwrite config settings in `cfg = Config()` anyway...)
 
 File-based entry point with automatic output files:
 
@@ -89,7 +71,22 @@ from hinspheres import fit_hinsa_model
 result = fit_hinsa_model(
     obs_hinsa_fits='G206_HI_cube.fits',
     obs_background_fits='G206_HI_background.fits',
+    R_out_pc=1.46,
+    distance_pc=300,     # pc here
+    vlsr_kms=9.3,
+    n_shells=5,
+    max_gen=50000,
+    popsize=50,
+    n_jobs=4,
+    output_dir=OUTPUT_DIR,
+    center_coord=center_coord,
+    fit_velocity_radius_kms=FIT_VELOCITY_RADIUS_KMS,
+    spatial_res_arcmin=BEAM_FWHM_ARCMIN,
+    method='cmaes',
     mode='forward',
+    seed=SEED,
+    verbose=1,
+    **kwargs,
 )
 print(result['best_params'], result['residual'], result['param_stds'])
 ```
@@ -126,7 +123,7 @@ HI abundance can also be given shell by shell with `abundance=[0.02, 0.03, ...]`
 | Mode | Needs background | Objective |
 |---|---|---|
 | `mode='forward'` (default, recommended) | yes (`obs_background_fits`) | Weighted residual between observed and modeled cube |
-| `mode='second_derivative'` | no | R-value of the second derivative of the background reconstructed by inverse RT (Liu et al. 2021) |
+| `mode='second_derivative'` (don't use it) | no | R-value of the second derivative of the background reconstructed by inverse RT (Liu et al. 2021) |
 
 Known limitation: `second_derivative` has a tau -> 0 degeneracy (the optimizer can drive the optical depth to zero and collapse the R-value), so use `mode='forward'` for real fits unless you have a specific reason not to.
 
