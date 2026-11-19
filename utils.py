@@ -1,6 +1,3 @@
-"""
-I/O, Planck loading, beam convolution, and diagnostic plotting.
-"""
 
 import numpy as np
 
